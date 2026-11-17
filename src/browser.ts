@@ -85,7 +85,7 @@ function extensionSource(): string | undefined {
   }
 }
 
-function buildExtension(config: { port: number; token: string }): void {
+function buildExtension(config: { port: number; token: string; pairing?: unknown }): void {
   const background = `${EXTENSION_PATH}/${BACKGROUND}`;
   const orig = `${background}.orig`;
 
@@ -153,7 +153,7 @@ async function loadExtension(port: number): Promise<void> {
 
 export async function launchBrowser(
   browser: Browser,
-  config: { port: number; token: string },
+  config: { port: number; token: string; pairing?: unknown },
 ): Promise<Deno.ChildProcess> {
   buildExtension(config);
   remove(browser.profile);

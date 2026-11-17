@@ -43,7 +43,11 @@
 
   function connect() {
     ws = new WebSocket(`ws://127.0.0.1:${port}`);
-    ws.onopen = () => send({ token });
+    ws.onopen = () => {
+      send({ token });
+      pairingSent = false;
+      sendPairing();
+    };
     ws.onerror = () => ws.close();
     ws.onclose = () => {
       pending = null;
@@ -53,5 +57,37 @@
   }
   if (!g_nativeAppPort) connectToBackgroundNativeAppAndSetUpListeners();
   g_nativeAppPort?.onMessage?.addListener(reply);
+
+  // persist-pairing: report the SRP session to the daemon once paired, restore a saved one at start.
+  const hex = (bits) => sjcl.codec.hex.fromBits(bits);
+  const unhex = (str) => sjcl.codec.hex.toBits(str.replace(/^0x/, ""));
+  const baseSetGlobalState = setGlobalState;
+  let pairingSent = false;
+  const sendPairing = () => {
+    if (pairingSent || g_theState !== "SessionKeySet" || !g_secretSession?.encKey) return;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    pairingSent = true;
+    send({
+      pairing: {
+        I: hex(g_secretSession.I.toBits()),
+        encKey: hex(g_secretSession.encKey),
+        protocolVersion: g_secretSession.protocolVersion,
+        shouldUseBase64: g_secretSession.shouldUseBase64,
+      },
+    });
+  };
+  setGlobalState = function (state, quiet) {
+    baseSetGlobalState(state, quiet);
+    if (state !== "SessionKeySet") pairingSent = false;
+    sendPairing();
+  };
+  const saved = self.APW_CONFIG.pairing;
+  if (saved && g_secretSession) {
+    g_secretSession.I = sjcl.bn.fromBits(unhex(saved.I));
+    g_secretSession.encKey = unhex(saved.encKey);
+    g_secretSession.protocolVersion = saved.protocolVersion;
+    g_secretSession.shouldUseBase64 = saved.shouldUseBase64;
+    baseSetGlobalState("SessionKeySet", true);
+  }
   connect();
 })();

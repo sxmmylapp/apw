@@ -1,10 +1,24 @@
-import { APWError, DATA_PATH, SOCKET_PATH, Status } from "./const.ts";
+import { APWError, DATA_PATH, PAIRING_PATH, SOCKET_PATH, Status } from "./const.ts";
 import { type Browser, launchBrowser } from "./browser.ts";
 import type { APWResponse, Message } from "./types.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
-type ExtensionMessage = APWResponse | { token: string };
+type ExtensionMessage = APWResponse | { token: string } | { pairing: Record<string, unknown> };
+
+function readPairing(): Record<string, unknown> | undefined {
+  try {
+    return JSON.parse(Deno.readTextFileSync(PAIRING_PATH));
+  } catch {
+    return undefined;
+  }
+}
+
+function writePairing(pairing: Record<string, unknown>): void {
+  Deno.writeTextFileSync(PAIRING_PATH, JSON.stringify(pairing), { mode: 0o600 });
+  Deno.chmodSync(PAIRING_PATH, 0o600);
+  console.info("[apw] pairing saved");
+}
 
 interface Pending {
   id: string;
@@ -48,6 +62,11 @@ class ExtensionSession {
         }
         this.ws = ws;
         console.info("[apw] extension connected");
+        return;
+      }
+
+      if ("pairing" in message) {
+        writePairing(message.pairing);
         return;
       }
 
@@ -152,7 +171,11 @@ export async function daemon(browser: Browser): Promise<void> {
     return response;
   });
 
-  const child = await launchBrowser(browser, { port: (wsServer.addr as Deno.NetAddr).port, token });
+  const child = await launchBrowser(browser, {
+    port: (wsServer.addr as Deno.NetAddr).port,
+    token,
+    pairing: readPairing(),
+  });
   console.info(`[apw] launched headless ${browser.name}; extension loaded.`);
   const shutdown = async () => {
     try {
