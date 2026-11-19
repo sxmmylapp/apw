@@ -5,9 +5,29 @@
   const send = (message) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify(message));
   const fail = (id, status, error) => send({ id, status, error: String(error) });
 
+  const INVALID_PARAM = 2, APW_STATUS = 4040;
+
   function request(message) {
+    if (message.cmd === APW_STATUS) {
+      return send({ id: message.id, status: OK, state: g_theState, nativePort: !!g_nativeAppPort });
+    }
     if (message.cmd === 2) {
-      message.pin == null ? ChallengePIN() : PINSet(message.pin);
+      // A PIN only means something while the helper is waiting for one (MSG1Set). Feeding PINSet in any
+      // other state re-runs the SRP step on a finished session and resets it: a stale or repeated
+      // `apw auth response` used to unpair a working apw.
+      if (g_theState === "SessionKeySet") return send({ id: message.id, status: OK, state: g_theState });
+      if (message.pin == null) {
+        ChallengePIN();
+        return send({ id: message.id, status: OK, state: g_theState });
+      }
+      if (g_theState !== "MSG1Set") {
+        return fail(
+          message.id,
+          INVALID_PARAM,
+          `no pairing code is pending (state ${g_theState}); run apw auth request`,
+        );
+      }
+      PINSet(message.pin);
       return send({ id: message.id, status: OK });
     }
     if (g_theState !== "SessionKeySet") return fail(message.id, INVALID_SESSION, "unpaired");

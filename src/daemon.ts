@@ -1,4 +1,4 @@
-import { APWError, DATA_PATH, SOCKET_PATH, Status } from "./const.ts";
+import { APWError, BROWSER_PID_PATH, Command, DATA_PATH, PINREAD_LABEL, SOCKET_PATH, Status } from "./const.ts";
 import { type Browser, launchBrowser } from "./browser.ts";
 import type { APWResponse, Message } from "./types.ts";
 
@@ -13,8 +13,9 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
-class ExtensionSession {
+export class ExtensionSession {
   private ws: WebSocket | null = null;
+  onConnect: () => void = () => {};
   private pending: Pending | null = null;
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -48,6 +49,7 @@ class ExtensionSession {
         }
         this.ws = ws;
         console.info("[apw] extension connected");
+        this.onConnect();
         return;
       }
 
@@ -64,6 +66,10 @@ class ExtensionSession {
       this.rejectPending(new Error("Extension disconnected"));
       console.info("[apw] extension disconnected");
     });
+  }
+
+  get connected(): boolean {
+    return this.ws !== null;
   }
 
   request(message: Message): Promise<APWResponse> {
@@ -136,6 +142,107 @@ async function handleCliConnection(
   }
 }
 
+type StatusReply = {
+  id: string;
+  status: Status;
+  error?: string;
+  state?: string;
+  browser?: boolean;
+  extension?: boolean;
+};
+
+/** `apw status`: answered by the daemon so it can say "no browser" without asking the extension. */
+export async function status(session: ExtensionSession, browserAlive: () => boolean): Promise<StatusReply> {
+  const browser = browserAlive();
+  if (!browser) {
+    return { id: "", status: Status.INVALID_SESSION, error: "browser not running", browser, extension: false };
+  }
+  if (!session.connected) {
+    return { id: "", status: Status.INVALID_SESSION, error: "extension not connected", browser, extension: false };
+  }
+  const reply = await session.request({ cmd: Command.APW_STATUS } as unknown as Message) as StatusReply;
+  const state = reply.state ?? "unknown";
+  return state === "SessionKeySet"
+    ? { id: "", status: Status.SUCCESS, state, browser, extension: true }
+    : { id: "", status: Status.INVALID_SESSION, error: `unpaired (${state})`, state, browser, extension: true };
+}
+
+const REPAIR_EVERY_MS = 15_000;
+const REREAD_AFTER_MS = 60_000;
+
+/**
+ * Re-pair with no human: when the extension is unpaired, ask the helper for a code (it shows the
+ * "Enable Password AutoFill" window) and start the PIN reader job, which reads the code off that window
+ * and answers through the socket. No reader job => one macOS notification asking for `apw auth`.
+ */
+export class Repairer {
+  private lastRead = 0;
+  private notified = -Infinity;
+  private busy = false;
+
+  constructor(
+    private session: ExtensionSession,
+    private browserAlive: () => boolean,
+    private startReader: () => Promise<boolean> = startPinReader,
+    private notify: (text: string) => Promise<void> = notifyUser,
+    private now: () => number = Date.now,
+  ) {}
+
+  async tick(): Promise<string> {
+    if (this.busy) return "busy";
+    this.busy = true;
+    try {
+      const reply = await status(this.session, this.browserAlive).catch((e) => ({
+        state: undefined,
+        error: String(e),
+      }));
+      const state = (reply as StatusReply).state;
+      if (state === "SessionKeySet" || state === undefined) return state ?? "no-extension";
+      if (state === "NotInSession") {
+        await this.session.request({ cmd: Command.HANDSHAKE });
+        console.info("[apw] unpaired: asked the helper for a pairing code");
+        this.lastRead = 0;
+      }
+      if (this.now() - this.lastRead < REREAD_AFTER_MS) return "waiting";
+      this.lastRead = this.now();
+      if (await this.startReader()) {
+        console.info(`[apw] started PIN reader ${PINREAD_LABEL}`);
+        return "reader";
+      }
+      if (this.now() - this.notified > 3_600_000) {
+        this.notified = this.now();
+        await this.notify("apw is unpaired: run `apw auth` and type the code from 'Enable Password AutoFill'.");
+      }
+      return "notified";
+    } finally {
+      this.busy = false;
+    }
+  }
+}
+
+async function startPinReader(): Promise<boolean> {
+  const target = `gui/${Deno.uid()}/${PINREAD_LABEL}`;
+  const out = await new Deno.Command("/bin/launchctl", { args: ["kickstart", target], stdout: "null", stderr: "piped" })
+    .output().catch(() => null);
+  if (!out?.success) {
+    console.info(
+      `[apw] PIN reader ${target} not available: ${
+        out ? new TextDecoder().decode(out.stderr).trim() : "launchctl failed"
+      }`,
+    );
+  }
+  return !!out?.success;
+}
+
+async function notifyUser(text: string): Promise<void> {
+  console.info(`[apw] notify: ${text}`);
+  await new Deno.Command("/usr/bin/osascript", {
+    args: ["-e", `display notification ${JSON.stringify(text)} with title "apw needs pairing"`],
+    stdout: "null",
+    stderr: "null",
+  }).output().catch(() => {});
+}
+
 export async function daemon(browser: Browser): Promise<void> {
   Deno.mkdirSync(DATA_PATH, { recursive: true, mode: 0o700 });
   Deno.chmodSync(DATA_PATH, 0o700);
@@ -153,15 +260,40 @@ export async function daemon(browser: Browser): Promise<void> {
   });
 
   const child = await launchBrowser(browser, { port: (wsServer.addr as Deno.NetAddr).port, token });
-  console.info(`[apw] launched headless ${browser.name}; extension loaded.`);
+  console.info(`[apw] launched headless ${browser.name} (pid ${child.pid}); extension loaded.`);
+  Deno.writeTextFileSync(BROWSER_PID_PATH, `${child.pid}\n`);
+  let browserAlive = true;
+  const cleanup = () => {
+    for (const path of [SOCKET_PATH, BROWSER_PID_PATH]) {
+      try {
+        Deno.removeSync(path);
+      } catch { /* gone */ }
+    }
+  };
+  let stopping = false;
   const shutdown = async () => {
+    stopping = true;
     try {
       child.kill("SIGTERM");
       await child.status;
     } catch { /* ignore */ }
+    cleanup();
     Deno.exit(0);
   };
   for (const signal of ["SIGINT", "SIGTERM"] as const) Deno.addSignalListener(signal, shutdown);
+
+  // Supervision: the pairing lives in the browser's native-messaging helper. If the browser dies
+  // (force quit, crash), a daemon left running would look healthy to launchd while every read fails.
+  // Exit instead: launchd (KeepAlive) starts a fresh apw, and the Repairer pairs it again.
+  child.status.then((s) => {
+    browserAlive = false;
+    if (stopping) return;
+    console.info(
+      `[apw] browser exited (code ${s.code}${s.signal ? `, signal ${s.signal}` : ""}); exiting so launchd restarts apw`,
+    );
+    cleanup();
+    Deno.exit(75);
+  });
 
   try {
     Deno.removeSync(SOCKET_PATH);
@@ -172,7 +304,17 @@ export async function daemon(browser: Browser): Promise<void> {
   console.info(`[apw] Unix socket at ${SOCKET_PATH}`);
   await Deno.chmod(SOCKET_PATH, 0o600);
 
+  const alive = () => browserAlive;
+  const repairer = new Repairer(session, alive);
+  const repair = () => repairer.tick().catch((e) => console.error(`[apw] repair: ${e}`));
+  session.onConnect = () => setTimeout(repair, 2_000);
+  setInterval(repair, REPAIR_EVERY_MS);
+
+  const front = {
+    request: (message: Message) =>
+      message.cmd === Command.APW_STATUS ? status(session, alive) : session.request(message),
+  };
   for await (const conn of unixListener) {
-    handleCliConnection(conn, session).catch(console.error);
+    handleCliConnection(conn, front).catch(console.error);
   }
 }

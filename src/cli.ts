@@ -186,6 +186,13 @@ const auth = new Command()
     printSuccess();
   });
 
+const statusCmd = new Command()
+  .description("Is apw paired? Exit 0 when the browser, extension and pairing are all up, else 9.")
+  .action(async () => {
+    const { id: _id, ...reply } = await client.status() as unknown as Record<string, unknown>;
+    console.log(JSON.stringify(reply));
+  });
+
 try {
   await new Command()
     .name("apw")
@@ -195,6 +202,7 @@ try {
     .command("pw", pw)
     .command("otp", otp)
     .command("start", start)
+    .command("status", statusCmd)
     .parse(Deno.args);
 } catch (error: unknown) {
   let status = Status.GENERIC_ERROR;

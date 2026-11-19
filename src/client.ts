@@ -142,6 +142,11 @@ export class ApplePasswordManager {
     }
   }
 
+  /** Daemon + browser + extension + pairing in one call; throws INVALID_SESSION (9) unless paired. */
+  async status(): Promise<APWResponse> {
+    return await this.sendMessage({ cmd: Command.APW_STATUS } as unknown as Message);
+  }
+
   async requestChallenge(): Promise<void> {
     await this.sendMessage({ cmd: Command.HANDSHAKE });
   }

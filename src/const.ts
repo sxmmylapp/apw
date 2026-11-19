@@ -4,6 +4,9 @@ export const SOCKET_PATH = `${DATA_PATH}/apw.sock`;
 export const EXTENSION_PATH = `${DATA_PATH}/extension`;
 export const BROWSER_PROFILE_PATH = `${DATA_PATH}/browser`;
 export const CONFIG_PATH = `${DATA_PATH}/config.json`;
+export const BROWSER_PID_PATH = `${DATA_PATH}/browser.pid`;
+// The PIN reader runs as its own launchd job so macOS checks ITS Accessibility grant, not apw's.
+export const PINREAD_LABEL = Deno.env.get("APW_PINREAD_LABEL") ?? "com.lod.apw-pinread";
 
 export class APWError extends Error {
   constructor(public status: Status, message?: string) {
@@ -31,6 +34,8 @@ export enum Command {
   GET_ONE_TIME_CODES = 16,
   DID_FILL_ONE_TIME_CODE = 17,
   OPEN_URL_IN_SAFARI = 1984,
+  // apw-only: never sent to Apple's helper. The bridge answers with the extension's pairing state.
+  APW_STATUS = 4040,
 }
 
 export enum SecretSessionVersion {
