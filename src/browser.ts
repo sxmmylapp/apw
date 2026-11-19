@@ -31,6 +31,9 @@ export const BROWSERS = [
   browser("chromium", "Ungoogled Chromium", "Chromium", "Chromium", "ungoogled-chromium"),
   browser("edge", "Microsoft Edge", "Microsoft Edge", "Microsoft Edge", "microsoft-edge"),
   browser("brave", "Brave", "Brave Browser", "BraveSoftware/Brave-Browser", "brave-browser"),
+  // Before "chrome": a separate app identity (com.google.Chrome.beta), so the user's own Chrome
+  // Dock icon and Force Quit never reach the hidden browser. Google-signed, which Apple's helper requires.
+  browser("chrome-beta", "Google Chrome Beta", "Google Chrome Beta", "Google/Chrome Beta", "google-chrome@beta"),
   browser("chrome", "Google Chrome", "Google Chrome", "Google/Chrome", "google-chrome"),
 ];
 
