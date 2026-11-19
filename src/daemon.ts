@@ -168,6 +168,7 @@ export async function status(session: ExtensionSession, browserAlive: () => bool
 }
 
 const REPAIR_EVERY_MS = 15_000;
+const PAIRING_STATES = new Set(["NotInSession", "ChallengeSent", "MSG1Set"]);
 const REREAD_AFTER_MS = 60_000;
 
 /**
@@ -186,6 +187,7 @@ export class Repairer {
     private startReader: () => Promise<boolean> = startPinReader,
     private notify: (text: string) => Promise<void> = notifyUser,
     private now: () => number = Date.now,
+    private restart: () => void = () => {},
   ) {}
 
   async tick(): Promise<string> {
@@ -198,6 +200,13 @@ export class Repairer {
       }));
       const state = (reply as StatusReply).state;
       if (state === "SessionKeySet" || state === undefined) return state ?? "no-extension";
+      if (!PAIRING_STATES.has(state)) {
+        // The native-messaging helper is gone (killed, crashed) and the extension never reconnects it:
+        // only a fresh browser brings it back.
+        console.info(`[apw] helper lost (${state}); restarting the browser`);
+        this.restart();
+        return "restart";
+      }
       if (state === "NotInSession") {
         await this.session.request({ cmd: Command.HANDSHAKE });
         console.info("[apw] unpaired: asked the helper for a pairing code");
@@ -305,7 +314,12 @@ export async function daemon(browser: Browser): Promise<void> {
   await Deno.chmod(SOCKET_PATH, 0o600);
 
   const alive = () => browserAlive;
-  const repairer = new Repairer(session, alive);
+  const startedAt = Date.now();
+  const restartBrowser = () => {
+    // Exit 75 via the child.status handler; launchd restarts apw. Not within a minute of start (no tight loop).
+    if (Date.now() - startedAt > 60_000) child.kill("SIGTERM");
+  };
+  const repairer = new Repairer(session, alive, undefined, undefined, undefined, restartBrowser);
   const repair = () => repairer.tick().catch((e) => console.error(`[apw] repair: ${e}`));
   session.onConnect = () => setTimeout(repair, 2_000);
   setInterval(repair, REPAIR_EVERY_MS);

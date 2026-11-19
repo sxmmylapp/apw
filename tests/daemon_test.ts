@@ -57,3 +57,18 @@ Deno.test("repair: no reader job => one notification per hour, not one per tick"
   await r.tick();
   assertEquals(notes, 1);
 });
+
+Deno.test("repair: helper gone (NativeSupportNotInstalled) => restart the browser, no reader", async () => {
+  const { s } = fakeSession("NativeSupportNotInstalled");
+  let restarts = 0;
+  const r = new Repairer(
+    s,
+    () => true,
+    () => Promise.reject("must not run"),
+    () => Promise.resolve(),
+    Date.now,
+    () => restarts++,
+  );
+  assertEquals(await r.tick(), "restart");
+  assertEquals(restarts, 1);
+});
