@@ -196,6 +196,9 @@ func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
   var pressedLabel: (label: String, at: Date)?
   var codeSeen: [pid_t: Date] = [:]
   var attempts: [pid_t: Int] = [:]
+  var lastNote = ""
+  /// Logs a decision only when it changes, so a waiting watcher writes one line, not one per tick.
+  func note(_ s: String) { if s != lastNote { log("chrome: \(s)"); lastNote = s } }
 
   func setWebAX(_ on: Bool) {
     guard webAX != on else { return }
@@ -222,7 +225,7 @@ func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
       chromePid = chrome.processIdentifier
       app = AXUIElementCreateApplication(chromePid)
       webAX = false
-      known = []; paired = []; presses = [:]; codeSeen = [:]; attempts = [:]; pressedLabel = nil
+      known = []; paired = []; presses = [:]; codeSeen = [:]; attempts = [:]; pressedLabel = nil; lastNote = ""
       log("chrome: Google Chrome running (pid \(chromePid))")
     }
     let helpers = Set(helperPids(parents: [chromePid]))
@@ -237,14 +240,18 @@ func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
     for h in showing where codeSeen[h] == nil { codeSeen[h] = Date() }
     for h in Array(codeSeen.keys) where !showing.contains(h) { codeSeen[h] = nil; attempts[h] = nil }
     if let h = showing.max(by: { codeSeen[$0]! < codeSeen[$1]! }) {
-      guard (attempts[h] ?? 0) < 2 else { continue }
+      guard (attempts[h] ?? 0) < 2 else { note("code window of helper \(h) still up after 2 tries; leaving it to Sammy"); continue }
       setWebAX(true)
-      guard let popup = findPopup(app), popup.pins.count == 6,
-        popup.pins.allSatisfy({ (ax($0, kAXEnabledAttribute) as? Bool) != false }),
+      guard let popup = findPopup(app) else { note("code window up (helper \(h)); no iCloud Passwords popup found in Chrome's AX tree"); continue }
+      guard popup.pins.count == 6 else { note("code window up (helper \(h)); popup found, PIN boxes not (\(popup.pins.count)/6)"); continue }
+      guard popup.pins.allSatisfy({ (ax($0, kAXEnabledAttribute) as? Bool) != false }),
         (axS(popup.pins[0], kAXValueAttribute) ?? "").isEmpty
-      else { continue }  // the popup is not asking yet
+      else { note("code window up (helper \(h)); PIN boxes already filled or disabled"); continue }
       if showPopup { log("chrome: popup \(describePopup(popup))") }
-      guard let code = viaAX(h) ?? windowIDs(h).lazy.compactMap(viaOCR).first else { continue }
+      guard let code = viaAX(h) ?? windowIDs(h).lazy.compactMap(viaOCR).first else {
+        note("code window up (helper \(h)); no code readable by AX or OCR"); continue
+      }
+      note("code window up (helper \(h)); popup asking; typing")
       attempts[h, default: 0] += 1
       let label = pressedLabel.flatMap { Date().timeIntervalSince($0.at) < 60 ? $0.label : nil } ?? mainLabel() ?? ""
       if dryRun { log("chrome: dry run: would type the code into profile '\(label)' popup"); attempts[h] = 2; continue }
@@ -266,12 +273,17 @@ func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
     }
 
     // No code window: open the popup ourselves when the front window's profile is not paired yet.
-    guard !helpers.isEmpty, chrome.isActive, idleSeconds() >= 2, let label = mainLabel(), !paired.contains(label)
-    else { continue }
+    guard !helpers.isEmpty else { note("waiting: extension not connected to Apple's helper"); continue }
+    // AXFrontmost asks Chrome itself; NSRunningApplication.isActive is a cached copy.
+    guard (ax(app, "AXFrontmost") as? Bool) == true else { note("waiting: Chrome not in front"); continue }
+    guard let label = mainLabel() else { note("waiting: no standard Chrome window in front"); continue }
+    guard !paired.contains(label) else { note("waiting: profile '\(label)' paired"); continue }
+    guard idleSeconds() >= 2 else { note("waiting: Sammy active (profile '\(label)' unpaired)"); continue }
     let prev = presses[label] ?? (0, .distantPast)
-    guard prev.n < 3, Date().timeIntervalSince(prev.at) > 30 else { continue }
+    guard prev.n < 6 else { note("gave up pressing in profile '\(label)' after 6 tries; click iCloud Passwords once"); continue }
+    guard Date().timeIntervalSince(prev.at) > 20 else { continue }
     setWebAX(true)
-    if findPopup(app) != nil { continue }  // a popup is already open
+    if let p = findPopup(app) { note("popup already open (PIN boxes \(p.pins.count)/6); waiting for the code window"); continue }
     presses[label] = (prev.n + 1, Date())
     if dryRun { log("chrome: dry run: would press iCloud Passwords in profile '\(label)'"); continue }
     guard let w = ax(app, kAXMainWindowAttribute) else { continue }
@@ -286,13 +298,20 @@ func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
       continue
     }
     pressedLabel = (label, Date())
-    let challenged = waitUntil(5) { helpers.contains { !windowIDs($0).isEmpty } }
-    if challenged { continue }  // the next pass types the code
-    if let p = findPopup(app), p.pins.isEmpty {
-      paired.insert(label)
-      if let d = p.dismiss { AXUIElementPerformAction(d, kAXPressAction as CFString) }
-      log("chrome: profile '\(label)' is already paired")
-      setWebAX(false)
+    log("chrome: pressed iCloud Passwords in profile '\(label)' (try \(prev.n + 1))")
+    let challenged = waitUntil(5) { Set(helperPids(parents: [chromePid])).contains { !windowIDs($0).isEmpty } }
+    if challenged { log("chrome: code window appeared after the press"); continue }  // the next pass types the code
+    if let p = findPopup(app) {
+      if p.pins.isEmpty {
+        paired.insert(label)
+        if let d = p.dismiss { AXUIElementPerformAction(d, kAXPressAction as CFString) }
+        log("chrome: profile '\(label)' is already paired")
+        setWebAX(false)
+      } else {
+        log("chrome: popup open with PIN boxes \(p.pins.count)/6 but no code window within 5 s")
+      }
+    } else {
+      log("chrome: press gave no popup in Chrome's AX tree within 5 s")
     }
   }
 }
