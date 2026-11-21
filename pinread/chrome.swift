@@ -145,21 +145,25 @@ func fillPIN(_ code: String, pid: pid_t, app: AXUIElement, popup: Popup) -> Bool
   return true
 }
 
-func pressToolbarButton(_ window: AXUIElement) -> Bool {
+enum Press { case pressed, missing, failed(AXError) }
+
+/// The pinned toolbar button; Chrome titles it "iCloud Passwords\nHas access to this site".
+func pressToolbarButton(_ window: AXUIElement) -> Press {
   func find(_ e: AXUIElement, _ d: Int) -> AXUIElement? {
     if d > 20 { return nil }
     let role = axS(e, kAXRoleAttribute) ?? ""
     if role == "AXWebArea" { return nil }
     if role == "AXPopUpButton" || role == "AXButton",
-      axS(e, kAXTitleAttribute) == "iCloud Passwords" || axS(e, kAXDescriptionAttribute) == "iCloud Passwords"
+      [kAXTitleAttribute, kAXDescriptionAttribute].contains(where: { (axS(e, $0) ?? "").hasPrefix("iCloud Passwords") })
     {
       return e
     }
     for k in axKids(e) { if let b = find(k, d + 1) { return b } }
     return nil
   }
-  guard let b = find(window, 0) else { return false }
-  return AXUIElementPerformAction(b, kAXPressAction as CFString) == .success
+  guard let b = find(window, 0) else { return .missing }
+  let err = AXUIElementPerformAction(b, kAXPressAction as CFString)
+  return err == .success ? .pressed : .failed(err)
 }
 
 func idleSeconds() -> Double {
@@ -270,9 +274,15 @@ func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
     if findPopup(app) != nil { continue }  // a popup is already open
     presses[label] = (prev.n + 1, Date())
     if dryRun { log("chrome: dry run: would press iCloud Passwords in profile '\(label)'"); continue }
-    guard let w = ax(app, kAXMainWindowAttribute), pressToolbarButton(w as! AXUIElement) else {
+    guard let w = ax(app, kAXMainWindowAttribute) else { continue }
+    switch pressToolbarButton(w as! AXUIElement) {
+    case .pressed: break
+    case .missing:
       log("chrome: no pinned iCloud Passwords button in profile '\(label)' front window")
       presses[label] = (3, Date())
+      continue
+    case .failed(let err):
+      log("chrome: pressing iCloud Passwords in profile '\(label)' failed (AXError \(err.rawValue))")
       continue
     }
     pressedLabel = (label, Date())
