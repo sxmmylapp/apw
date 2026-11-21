@@ -116,6 +116,42 @@ func idleSeconds() -> Double {
   }.min() ?? 0
 }
 
+/// The everyday Chrome: the pid already being watched while it is alive, else the running com.google.Chrome
+/// started without --user-data-dir (a test or tool instance with its own profile dir is never the daily one).
+/// NSRunningApplication's per-bundle list can come back empty for one pass while Chrome runs (seen 2026-11-21 as
+/// "Google Chrome quit" then "running" with the same pid, which reset every profile's state), so a live pid wins.
+func dailyChrome(current: pid_t) -> NSRunningApplication? {
+  if current != 0, kill(current, 0) == 0, let a = NSRunningApplication(processIdentifier: current),
+    a.bundleIdentifier == dailyChromeBundle, !a.isTerminated
+  {
+    return a
+  }
+  return NSRunningApplication.runningApplications(withBundleIdentifier: dailyChromeBundle)
+    .filter { !$0.isTerminated && !processArgs($0.processIdentifier).contains(where: { $0.hasPrefix("--user-data-dir") }) }
+    .min(by: { ($0.launchDate ?? .distantFuture) < ($1.launchDate ?? .distantFuture) })
+}
+
+/// argv of a process (KERN_PROCARGS2), [] when unreadable.
+func processArgs(_ pid: pid_t) -> [String] {
+  var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+  var size = 0
+  guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+  var buf = [UInt8](repeating: 0, count: size)
+  guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return [] }
+  let argc = buf.withUnsafeBytes { Int($0.load(as: Int32.self)) }
+  var i = 4
+  while i < size && buf[i] != 0 { i += 1 }  // exec path
+  while i < size && buf[i] == 0 { i += 1 }
+  var out: [String] = []
+  while out.count < argc && i < size {
+    var j = i
+    while j < size && buf[j] != 0 { j += 1 }
+    out.append(String(decoding: buf[i..<j], as: UTF8.self))
+    i = j + 1
+  }
+  return out
+}
+
 func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
   dump = false  // the shared AX/OCR readers print window text, which holds the code; this mode never does
   log("chrome: watching \(dailyChromeBundle) for iCloud Passwords pairing\(dryRun ? " (dry run: never presses or types)" : "")")
@@ -205,14 +241,14 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     return ok
   }
 
-  while true {
-    spin(0.5)
-    guard let chrome = NSRunningApplication.runningApplications(withBundleIdentifier: dailyChromeBundle)
-      .first(where: { !$0.isTerminated })
-    else {
+  // Each pass runs in its own autoreleasepool: AX, CGWindowList, NSRunningApplication and OCR objects are
+  // autoreleased and this loop never returns to a pool-draining caller (measured 2026-11-21: ~135 MB/15 min
+  // phys_footprint growth, 8.6 GB after a day, without it).
+  func pass() {
+    guard let chrome = dailyChrome(current: chromePid) else {
       if chromePid != 0 { log("chrome: Google Chrome quit") }
       chromePid = 0
-      continue
+      return
     }
     if chrome.processIdentifier != chromePid {
       chromePid = chrome.processIdentifier
@@ -233,16 +269,16 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     if let h = showing.first(where: { (typed[$0] ?? 0) < 2 }) {
       let label = pending ?? mainLabel() ?? "?"
       guard frontmost(), idleSeconds() >= 1 else {
-        note("code ready for '\(label)': Chrome needs you in front, hands off, for 3 s"); continue
+        note("code ready for '\(label)': Chrome needs you in front, hands off, for 3 s"); return
       }
       _ = typeCode(helper: h, label: label)
-      continue
+      return
     }
-    guard showing.isEmpty else { note("code window still up after two tries; leaving it to Sammy"); continue }
+    guard showing.isEmpty else { note("code window still up after two tries; leaving it to Sammy"); return }
 
     // No code window: check each profile not known paired, one press at a time. Measured 2026-11-21: a press while
     // another app is in front brings Chrome to the front, so presses wait until Sammy has Chrome in front himself.
-    guard !helpers.isEmpty else { note("waiting: extension not connected to Apple's helper"); continue }
+    guard !helpers.isEmpty else { note("waiting: extension not connected to Apple's helper"); return }
     let todo = standardWindows().filter { !paired.contains($0.label) }
     var seen = Set<String>()
     guard let next = todo.first(where: { seen.insert($0.label).inserted && (tries[$0.label]?.n ?? 0) < 4
@@ -252,23 +288,23 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       else if todo.allSatisfy({ (tries[$0.label]?.n ?? 0) >= 4 }) {
         note("gave up on \(Set(todo.map(\.label)).sorted()) after 4 tries each; click iCloud Passwords once there")
       }
-      continue
+      return
     }
     let unchecked = Set(todo.map(\.label)).sorted()
-    guard frontmost() else { note("waiting: Chrome in front, hands off for 2 s, to check \(unchecked)"); continue }
-    guard idleSeconds() >= 2 else { note("waiting: Sammy active in Chrome (unchecked: \(unchecked))"); continue }
-    guard popupWindow(chromePid) == nil else { note("waiting: a popup is already open"); continue }
+    guard frontmost() else { note("waiting: Chrome in front, hands off for 2 s, to check \(unchecked)"); return }
+    guard idleSeconds() >= 2 else { note("waiting: Sammy active in Chrome (unchecked: \(unchecked))"); return }
+    guard popupWindow(chromePid) == nil else { note("waiting: a popup is already open"); return }
     let label = next.label
     tries[label] = ((tries[label]?.n ?? 0) + 1, Date())
     guard let b = toolbarButton(next.win) else {
-      note("no pinned iCloud Passwords button in profile '\(label)'; pin it once"); tries[label] = (4, Date()); continue
+      note("no pinned iCloud Passwords button in profile '\(label)'; pin it once"); tries[label] = (4, Date()); return
     }
-    if dryRun { note("dry run: would press iCloud Passwords in profile '\(label)'"); continue }
+    if dryRun { note("dry run: would press iCloud Passwords in profile '\(label)'"); return }
     let wasFront = frontmost()
     let err = AXUIElementPerformAction(b, kAXPressAction as CFString)
-    guard err == .success else { log("chrome: pressing iCloud Passwords in '\(label)' failed (AXError \(err.rawValue))"); continue }
+    guard err == .success else { log("chrome: pressing iCloud Passwords in '\(label)' failed (AXError \(err.rawValue))"); return }
     guard waitUntil(3, { popupWindow(chromePid) != nil }) else {
-      log("chrome: pressed iCloud Passwords in '\(label)' (try \(tries[label]!.n), Chrome front before: \(wasFront)); no popup window appeared"); continue
+      log("chrome: pressed iCloud Passwords in '\(label)' (try \(tries[label]!.n), Chrome front before: \(wasFront)); no popup window appeared"); return
     }
     spin(0.6)  // let the popup render before reading it
     var state = readPopup()
@@ -289,5 +325,10 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     case nil:
       log("chrome: popup in '\(label)' closed before it could be read (\(ctx))")
     }
+  }
+
+  while true {
+    spin(0.5)
+    autoreleasepool { pass() }
   }
 }
