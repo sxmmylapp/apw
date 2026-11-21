@@ -110,3 +110,22 @@ Deno.test("chrome watcher reads the extension popup's state from its OCR text", 
   assertEquals(await popup("iCloud Passwords\nEnable Password AutoFill\n"), "asking");
   assertEquals(await popup("iCloud Passwords\nGetting passwords"), "other");
 });
+
+async function relaunch(...argv: string[]): Promise<string[]> {
+  const out = await new Deno.Command(bin, { args: ["--relaunch-args", ...argv] }).output();
+  return new TextDecoder().decode(out.stdout).trim().split("\n");
+}
+
+Deno.test("chrome watcher relaunches with one merged --disable-features (Chrome reads only the last)", async () => {
+  // A Dock launch: no switches (macOS may add -psn_0_x, never a switch).
+  assertEquals(await relaunch(), ["--disable-features=DestroyProfileOnBrowserClose"]);
+  assertEquals(await relaunch("-psn_0_123"), ["--disable-features=DestroyProfileOnBrowserClose"]);
+  assertEquals(
+    await relaunch("--user-data-dir=/tmp/x", "--disable-features=A,B", "https://example.com"),
+    ["--user-data-dir=/tmp/x", "--disable-features=A,B,DestroyProfileOnBrowserClose"],
+  );
+  assertEquals(
+    await relaunch("--disable-features=DestroyProfileOnBrowserClose"),
+    ["--disable-features=DestroyProfileOnBrowserClose"],
+  );
+});

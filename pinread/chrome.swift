@@ -5,8 +5,12 @@
 // and exits, and the next window of that profile asks again while Chrome never quit. Measured 2026-11-21 (Chrome
 // Beta 159, A/B twice): closing the only window ends the helper within 10 s; with
 // --disable-features=DestroyProfileOnBrowserClose the helper and worker stay, and chrome://restart keeps the flag.
-// So a daily Chrome running without that flag is relaunched with it (its new window hidden) the first time it has had no window
-// for 30 s while another app is in front (no download in progress); from then on only a real Chrome quit re-pairs.
+// So a daily Chrome running without that flag is relaunched with it: at once when it was just started (a Dock, Spotlight
+// or link launch after a real quit; no policy, Local State flag or launch-time setting can disable a feature on stable
+// Chrome, and a wrapper app would change the Dock icon), else the first time it has had no window for 30 s while another
+// app is in front (its new window hidden). Either way no download in progress, at most once per 10 min; from then on
+// only a real Chrome quit re-pairs. A fresh Chrome whose extension has not yet started Apple's helper is woken by
+// pressing its toolbar button (the same press a check makes), so no click is needed after a launch.
 // Measured on Chrome 157 (2026-11-21), and what this watcher is built on:
 //   - AXPress on the pinned "iCloud Passwords" toolbar button opens that window's extension popup, also in a
 //     background window of another profile. The popup is a small Chrome-owned window (AXSubrole AXUnknown).
@@ -29,17 +33,39 @@ import ApplicationServices
 import Foundation
 
 let dailyChromeBundle = ProcessInfo.processInfo.environment["APW_CHROME_BUNDLE"] ?? "com.google.Chrome"  // env: tests only
+// env: tests only. The daily Chrome is the instance started with exactly this --user-data-dir (else: none).
+let dailyChromeDataDir = ProcessInfo.processInfo.environment["APW_CHROME_USER_DATA_DIR"]
 let keepProfilesFeature = "DestroyProfileOnBrowserClose"
+
+/// The arguments to start Chrome again with: its own switches, with keepProfilesFeature merged into its one
+/// --disable-features (Chrome reads only the last one, so a second switch would undo the first).
+func relaunchArgs(_ argv: [String]) -> [String] {
+  var out: [String] = [], features: [String] = []
+  for a in argv.dropFirst() where a.hasPrefix("--") {
+    if a.hasPrefix("--disable-features=") {
+      features += a.dropFirst("--disable-features=".count).split(separator: ",").map(String.init)
+    } else {
+      out.append(a)
+    }
+  }
+  if !features.contains(keepProfilesFeature) { features.append(keepProfilesFeature) }
+  return out + ["--disable-features=\(features.joined(separator: ","))"]
+}
 
 /// Chrome was started with --disable-features=...DestroyProfileOnBrowserClose..., so a closed window keeps its profile.
 func keepsProfiles(_ pid: pid_t) -> Bool {
   processArgs(pid).contains { $0.hasPrefix("--disable-features=") && $0.contains(keepProfilesFeature) }
 }
 
-/// A Chrome download is running (a quit would cancel it).
+/// A Chrome download is running (a quit would cancel it): a .crdownload in ~/Downloads written in the last 2 min
+/// (an old one left by a crash would otherwise block every relaunch forever).
 func downloadInProgress() -> Bool {
   let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
-  return ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).contains { $0.hasSuffix(".crdownload") }
+  return ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).contains { name in
+    guard name.hasSuffix(".crdownload") else { return false }
+    let m = (try? FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent(name).path))?[.modificationDate] as? Date
+    return Date().timeIntervalSince(m ?? .distantPast) < 120
+  }
 }
 
 func ax(_ e: AXUIElement, _ k: String) -> CFTypeRef? {
@@ -100,6 +126,32 @@ func toolbarButton(_ window: AXUIElement) -> AXUIElement? {
   return find(window, 0)
 }
 
+/// What a window's address bar shows (Chrome's omnibox, AX description "Address and search bar"), nil when empty.
+func addressBarText(_ window: AXUIElement) -> String? {
+  func find(_ e: AXUIElement, _ d: Int) -> String? {
+    if d > 20 { return nil }
+    let role = axS(e, kAXRoleAttribute) ?? ""
+    if role == "AXWebArea" { return nil }
+    if role == "AXTextField", axS(e, kAXDescriptionAttribute) == "Address and search bar" {
+      let v = (axS(e, kAXValueAttribute) ?? "").trimmingCharacters(in: .whitespaces)
+      return v.isEmpty ? nil : v
+    }
+    for k in axKids(e) { if let v = find(k, d + 1) { return v } }
+    return nil
+  }
+  return find(window, 0)
+}
+
+/// Chrome's last-used profile opens with "Continue where you left off" (session.restore_on_startup 1): a relaunch
+/// brings its tabs back by itself, so passing them again would open each twice.
+func restoresSession(userDataDir: String) -> Bool {
+  func json(_ path: String) -> [String: Any]? {
+    (try? Data(contentsOf: URL(fileURLWithPath: path))).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+  }
+  let last = ((json("\(userDataDir)/Local State")?["profile"] as? [String: Any])?["last_used"] as? String) ?? "Default"
+  return ((json("\(userDataDir)/\(last)/Preferences")?["session"] as? [String: Any])?["restore_on_startup"] as? Int) == 1
+}
+
 let digitKeyCodes: [Character: CGKeyCode] = [
   "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
 ]
@@ -146,7 +198,11 @@ func dailyChrome(current: pid_t) -> NSRunningApplication? {
     return a
   }
   return NSRunningApplication.runningApplications(withBundleIdentifier: dailyChromeBundle)
-    .filter { !$0.isTerminated && !processArgs($0.processIdentifier).contains(where: { $0.hasPrefix("--user-data-dir") }) }
+    .filter { a in
+      guard !a.isTerminated else { return false }
+      let dirs = processArgs(a.processIdentifier).filter { $0.hasPrefix("--user-data-dir") }
+      return dailyChromeDataDir.map { dirs == ["--user-data-dir=\($0)"] } ?? dirs.isEmpty
+    }
     .min(by: { ($0.launchDate ?? .distantFuture) < ($1.launchDate ?? .distantFuture) })
 }
 
@@ -184,6 +240,7 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
   var lastNote = "", lastFront = ""
   var windowlessSince: Date?  // Chrome without the keep-profiles flag has had no window, with another app in front
   var lastRelaunch = Date.distantPast
+  var freshLaunch = false  // the watched Chrome was first seen without the flag; try relaunchIfFresh while young
   func note(_ s: String) { if s != lastNote { log("chrome: \(s)"); lastNote = s } }
 
   /// Chrome is the active app. Two independent reads; their raw values are logged whenever they change.
@@ -200,6 +257,10 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       let l = chromeWindowLabel(t)
       return l.isEmpty ? nil : (w, l)
     }
+  }
+  /// Every browser window, profile label or not (a one-profile Chrome titles its windows without one).
+  func standardWindowsAny() -> [AXUIElement] {
+    ((ax(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []).filter { axS($0, kAXSubroleAttribute) == "AXStandardWindow" }
   }
   func mainLabel() -> String? {
     guard let w = ax(app, kAXMainWindowAttribute), let t = axS(w as! AXUIElement, kAXTitleAttribute) else { return nil }
@@ -262,9 +323,6 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     return ok
   }
 
-  // Each pass runs in its own autoreleasepool: AX, CGWindowList, NSRunningApplication and OCR objects are
-  // autoreleased and this loop never returns to a pool-draining caller (measured 2026-11-21: ~135 MB/15 min
-  // phys_footprint growth, 8.6 GB after a day, without it).
   /// Chrome lacks the keep-profiles flag: once it has had no window for 30 s with another app in front, quit it
   /// (like Cmd+Q: nothing is open) and start it again hidden with the flag. At most once per 10 min.
   func relaunchIfWindowless(_ chrome: NSRunningApplication) -> Bool {
@@ -278,18 +336,55 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     guard Date().timeIntervalSince(since) >= 30, Date().timeIntervalSince(lastRelaunch) > 600 else { return false }
     guard idleSeconds() >= 5 else { return false }  // the new window can take the front for a moment
     guard !downloadInProgress() else { note("Chrome has no window but a download is running; not relaunching it"); return false }
+    windowlessSince = nil
+    return relaunch(chrome, hidden: true, why: "has had no window for 30 s")
+  }
+
+  /// Chrome was just started without the flag (a Dock, Spotlight or link launch after a real quit): quit it and
+  /// start it again with the flag at once, before Sammy works in it; its session restore brings the windows back.
+  /// Only while it is under 15 s old and no key has been typed since it started; at most once per 10 min.
+  func relaunchIfFresh(_ chrome: NSRunningApplication) -> Bool {
+    guard let started = chrome.launchDate else { return false }
+    let age = Date().timeIntervalSince(started)
+    guard age < 15 else { freshLaunch = false; return false }
+    guard Date().timeIntervalSince(lastRelaunch) > 600 else {
+      freshLaunch = false; note("Chrome started without the flag within 10 min of the last relaunch; not relaunching again"); return false
+    }
+    guard !downloadInProgress() else { freshLaunch = false; note("Chrome started without the flag but a download is running; not relaunching it"); return false }
+    guard CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown) > age else {
+      freshLaunch = false; note("Chrome started without the flag and Sammy is already typing; relaunching later once it has no window"); return false
+    }
+    // A quit sent mid-launch is dropped, and a link that started Chrome is in its first window only once that is up.
+    guard chrome.isFinishedLaunching, !standardWindowsAny().isEmpty else { return false }
+    spin(0.5)
+    freshLaunch = false
+    return relaunch(chrome, hidden: false, why: "was just started (\(Int(age * 1000)) ms ago)")
+  }
+
+  /// Quit Chrome (like Cmd+Q) and start it again with its own switches plus the flag. hidden: keep the new
+  /// window out of sight and the front with the app Sammy had; else it comes up like the launch it replaces.
+  func relaunch(_ chrome: NSRunningApplication, hidden: Bool, why: String) -> Bool {
     guard let url = chrome.bundleURL else { return false }
     lastRelaunch = Date()
-    windowlessSince = nil
-    if dryRun { log("chrome: dry run: would relaunch windowless Chrome (pid \(chromePid)) hidden with --disable-features=\(keepProfilesFeature)"); return false }
-    log("chrome: Chrome (pid \(chromePid)) has had no window for 30 s and lacks --disable-features=\(keepProfilesFeature); relaunching it with the flag so closing a window no longer drops the pairing")
     let old = chromePid
+    let argv = processArgs(old)
+    var args = relaunchArgs(argv)
+    // What the windows show goes along as URLs (a link that started Chrome would be lost: its default start page is
+    // a new tab), unless the profile restores its session itself. A new tab shows an empty address bar.
+    let dataDir = argv.first(where: { $0.hasPrefix("--user-data-dir=") }).map { String($0.dropFirst("--user-data-dir=".count)) }
+      ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Google/Chrome").path
+    let urls = hidden || restoresSession(userDataDir: dataDir) ? [] : standardWindowsAny().compactMap(addressBarText)
+    args += urls
+    if dryRun { log("chrome: dry run: would relaunch Chrome (pid \(old)), which \(why), with --disable-features=\(keepProfilesFeature)"); return false }
+    log("chrome: Chrome (pid \(old)) \(why) and lacks --disable-features=\(keepProfilesFeature); relaunching it with the flag so closing a window no longer drops the pairing")
+    let wasFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == old
+    let t0 = Date()
     chrome.terminate()
     guard waitUntil(30, { kill(old, 0) != 0 }) else { log("chrome: Chrome (pid \(old)) did not quit within 30 s; left running"); return true }
     let before = NSWorkspace.shared.frontmostApplication
     let cfg = NSWorkspace.OpenConfiguration()
-    cfg.arguments = ["--disable-features=\(keepProfilesFeature)"]
-    cfg.activates = false  // hides = true would make Chrome start as a hidden login item: no window, then it quits
+    cfg.arguments = args
+    cfg.activates = !hidden && wasFront  // hides = true would make Chrome start as a hidden login item: no window, then it quits
     cfg.addsToRecentItems = false
     cfg.createsNewApplicationInstance = true  // else a tool's Chrome of the same bundle (own --user-data-dir) is reused
     var done = false, launched: NSRunningApplication?
@@ -300,10 +395,16 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     }
     _ = waitUntil(30) { done }
     guard let a = launched else { return true }
-    // Chrome's new window takes the front despite activates = false (measured 2026-11-21): hide Chrome and give
-    // the front back to the app Sammy had, so nothing new shows until he clicks Chrome.
     let axa = AXUIElementCreateApplication(a.processIdentifier)
     let windowUp = waitUntil(20) { !((ax(axa, kAXWindowsAttribute) as? [AXUIElement]) ?? []).isEmpty }
+    let gapMs = Int(Date().timeIntervalSince(t0) * 1000)
+    guard hidden else {
+      let n = (ax(axa, kAXWindowsAttribute) as? [AXUIElement])?.count ?? 0
+      log("chrome: relaunched Chrome (pid \(a.processIdentifier)) with the flag and \(urls.count) page(s) it showed; \(windowUp ? "\(n) window(s) back" : "no window seen in 20 s") \(gapMs) ms after the quit")
+      return true
+    }
+    // Chrome's new window takes the front despite activates = false (measured 2026-11-21): hide Chrome and give
+    // the front back to the app Sammy had, so nothing new shows until he clicks Chrome.
     _ = waitUntil(10) { a.isFinishedLaunching }
     var hideTries = 0
     let hid = waitUntil(5) {  // hide() is refused until Chrome is done launching its window
@@ -315,7 +416,6 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     log("chrome: relaunched Chrome (pid \(a.processIdentifier)) with the flag; window \(windowUp ? "up" : "not seen in 20 s"), hidden: \(hid) after \(hideTries) tries, front: \(front?.localizedName ?? "?") (pid \(front?.processIdentifier ?? 0))")
     return true
   }
-
   func pass() {
     guard let chrome = dailyChrome(current: chromePid) else {
       if chromePid != 0 { log("chrome: Google Chrome quit") }
@@ -327,9 +427,14 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       app = AXUIElementCreateApplication(chromePid)
       known = []; paired = []; tries = [:]; typed = [:]; pending = nil; lastNote = ""; lastFront = ""
       windowlessSince = nil
-      log("chrome: Google Chrome running (pid \(chromePid))")
+      freshLaunch = !keepsProfiles(chromePid)
+      log("chrome: Google Chrome running (pid \(chromePid))\(freshLaunch ? " without --disable-features=\(keepProfilesFeature)" : "")")
     }
-    if !keepsProfiles(chromePid), relaunchIfWindowless(chrome) { return }
+    if !keepsProfiles(chromePid) {
+      if freshLaunch, relaunchIfFresh(chrome) { return }
+      if freshLaunch { return }  // still launching: no presses into a Chrome about to be relaunched
+      if relaunchIfWindowless(chrome) { return }
+    }
     let helpers = Set(helperPids(parents: [chromePid]))
     if !helpers.subtracting(known).isEmpty {
       log("chrome: extension connected to Apple's helper (pids \(helpers.sorted())); checking each profile")
@@ -352,8 +457,10 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
 
     // No code window: check each profile not known paired, one press at a time. Measured 2026-11-21: a press while
     // another app is in front brings Chrome to the front, so presses wait until Sammy has Chrome in front himself.
-    guard !helpers.isEmpty else { note("waiting: extension not connected to Apple's helper"); return }
+    // No helper yet (a fresh Chrome: the extension starts Apple's helper only when its popup opens): the same
+    // press below wakes it, and the next passes pair as usual.
     let todo = standardWindows().filter { !paired.contains($0.label) }
+    if helpers.isEmpty && todo.isEmpty { note("waiting: extension not connected to Apple's helper and no profile window to wake it in"); return }
     var seen = Set<String>()
     guard let next = todo.first(where: { seen.insert($0.label).inserted && (tries[$0.label]?.n ?? 0) < 4
       && Date().timeIntervalSince(tries[$0.label]?.at ?? .distantPast) > 20 })
@@ -365,16 +472,19 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       return
     }
     let unchecked = Set(todo.map(\.label)).sorted()
-    guard frontmost() else { note("waiting: Chrome in front, hands off for 2 s, to check \(unchecked)"); return }
+    let what = helpers.isEmpty ? "wake the extension (not connected to Apple's helper) in" : "check"
+    guard frontmost() else { note("waiting: Chrome in front, hands off for 2 s, to \(what) \(unchecked)"); return }
     guard idleSeconds() >= 2 else { note("waiting: Sammy active in Chrome (unchecked: \(unchecked))"); return }
     guard popupWindow(chromePid) == nil else { note("waiting: a popup is already open"); return }
     let label = next.label
     tries[label] = ((tries[label]?.n ?? 0) + 1, Date())
     guard let b = toolbarButton(next.win) else {
-      note("no pinned iCloud Passwords button in profile '\(label)'; pin it once"); tries[label] = (4, Date()); return
+      // A just-started Chrome draws its extension buttons after the window (seen 2026-11-21): an ordinary try.
+      note("no pinned iCloud Passwords button in profile '\(label)' yet (try \(tries[label]!.n)); pin it once if this stays"); return
     }
     if dryRun { note("dry run: would press iCloud Passwords in profile '\(label)'"); return }
     let wasFront = frontmost()
+    if helpers.isEmpty { log("chrome: extension not connected to Apple's helper; pressing iCloud Passwords in '\(label)' to wake it") }
     let err = AXUIElementPerformAction(b, kAXPressAction as CFString)
     guard err == .success else { log("chrome: pressing iCloud Passwords in '\(label)' failed (AXError \(err.rawValue))"); return }
     guard waitUntil(3, { popupWindow(chromePid) != nil }) else {
@@ -401,6 +511,9 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     }
   }
 
+  // Each pass runs in its own autoreleasepool: AX, CGWindowList, NSRunningApplication and OCR objects are
+  // autoreleased and this loop never returns to a pool-draining caller (measured 2026-11-21: ~135 MB/15 min
+  // phys_footprint growth, 8.6 GB after a day, without it).
   while true {
     spin(0.5)
     autoreleasepool { pass() }

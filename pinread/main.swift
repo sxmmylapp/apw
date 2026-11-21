@@ -20,7 +20,7 @@ import Vision
 let helperName = "PasswordManagerBrowserExtensionHelper"
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 var dump = false, send = true, timeout = 30.0
-var parseText: String?, labelText: String?, popupText: String?
+var parseText: String?, labelText: String?, popupText: String?, relaunchArgv: [String]?
 var watch = false, dryRun = false, saveClick = false
 var classifyArgs: [String]?
 var args = CommandLine.arguments.dropFirst().makeIterator()
@@ -35,6 +35,7 @@ while let a = args.next() {
   case "--watch-chrome": watch = true
   case "--dry-run": dryRun = true
   case "--save-click": saveClick = true
+  case "--relaunch-args": relaunchArgv = Array(CommandLine.arguments.drop { $0 != "--relaunch-args" }.dropFirst())
   case "--classify-alert": classifyArgs = Array(CommandLine.arguments.drop { $0 != "--classify-alert" }.dropFirst())
   default: break
   }
@@ -57,6 +58,7 @@ if let t = popupText {
   switch popupState(t) { case .asking: print("asking"); case .paired: print("paired"); case .other: print("other") }
   exit(0)
 }
+if let a = relaunchArgv { print(relaunchArgs(["chrome"] + a).joined(separator: "\n")); exit(0) }
 if let a = classifyArgs { classifyAlertCLI(a) }
 
 func parentPid(_ pid: pid_t) -> pid_t? {
