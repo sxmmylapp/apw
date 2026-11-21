@@ -92,3 +92,21 @@ Deno.test("save clicker refuses an update alert for another account or site", as
   await no(["alert", update("build-test1", "lappsonlinedynamics.com"), "--", "Not Now"]);
   await no(["alert", "Save Password?", "Saving for “someone”", "--", "Save Password"]);
 });
+
+async function popup(text: string): Promise<string> {
+  const out = await new Deno.Command(bin, { args: ["--popup-state", text] }).output();
+  return new TextDecoder().decode(out.stdout).trim();
+}
+
+Deno.test("chrome watcher reads the extension popup's state from its OCR text", async () => {
+  // OCR of the live popup, both profiles, 2026-11-21 (digits never present: the PIN boxes are empty).
+  assertEquals(
+    await popup(
+      "iCloud Passwords\nYour passwords are synced with iCloud Keychain\nYou can look up and manage saved passwords in the\nPasswords app.",
+    ),
+    "paired",
+  );
+  // Title of the PIN view, extension _locales/en enableAutoFillPasswordsTitle.
+  assertEquals(await popup("iCloud Passwords\nEnable Password AutoFill\n"), "asking");
+  assertEquals(await popup("iCloud Passwords\nGetting passwords"), "other");
+});

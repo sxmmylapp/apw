@@ -1,25 +1,25 @@
 // apw-pinread --watch-chrome: keep Sammy's everyday Google Chrome paired with iCloud Passwords, no human.
-// Apple's extension keeps its pairing key only in its service worker's memory, so every Chrome start (and every
-// time the extension reconnects to Apple's helper) asks for a fresh 6-digit code. This watcher:
-//   1. sees a PasswordManagerBrowserExtensionHelper whose PARENT is the everyday Chrome (bundle com.google.Chrome
-//      exactly; apw's own Chrome Beta and any other browser never match) showing its code window,
-//   2. reads the code from that window (AX, else OCR of that one window), as apw-pinread does for apw,
-//   3. finds Chrome's iCloud Passwords popup (chrome-extension://<ext>/page_popup.html) and its PIN0..PIN5 fields
-//      through AX, and for each digit: AX-focuses the field, checks Chrome's focused element IS that field, then posts
-//      the digit's key event to the Chrome process only (CGEvent.postToPid) - never to whatever app is frontmost.
-//      The popup submits on the 6th keydown (Apple's code listens for keydown only; an AXValue set never submits).
-//   4. opens that popup itself: when the extension has (re)connected and the front Chrome window's profile is not
-//      paired yet, it AX-presses the pinned "iCloud Passwords" toolbar button once the user is idle, so the in-page
-//      "Enable Password AutoFill" prompt never needs a click. A popup that shows no PIN fields means the profile is
-//      already paired: it is closed with the popup's own dismiss link.
-// The code is never logged or written anywhere.
+// Apple's extension keeps its pairing key only in its service worker's memory, so every Chrome start asks each
+// profile for a fresh 6-digit code. Measured on Chrome 157 (2026-11-21), and what this watcher is built on:
+//   - AXPress on the pinned "iCloud Passwords" toolbar button opens that window's extension popup, also in a
+//     background window of another profile. The popup is a small Chrome-owned window (AXSubrole AXUnknown).
+//   - Chrome does NOT expose the popup's web content to AX (only empty AXGroups; AXEnhancedUserInterface is
+//     refused), so the popup's state is read by OCR of that one window: "Enable Password AutoFill" = asking for
+//     the code; "synced with iCloud Keychain" / a login list = paired. The popup's PIN boxes are empty, so this
+//     never reads a code. Apple's code window belongs to a PasswordManagerBrowserExtensionHelper whose parent is
+//     this Chrome (one helper per profile); apw's Chrome Beta helpers never match.
+//   - The popup focuses its first PIN box itself and submits on the 6th digit keydown (an AXValue set never would).
+// Loop: for each profile window not yet known paired, once the user is idle and Chrome is in front: press its
+// button, OCR the popup. Paired -> close it (press again). Asking -> wait for Apple's code window, read the code
+// (AX, else OCR of that window), and post the six digit keys to the Chrome process only (CGEvent.postToPid),
+// checking before EVERY key that Chrome is frontmost and its focused window is that popup. Done when the code
+// window closes and the popup stops asking. A code window Sammy summoned himself (in-page prompt) is filled the
+// same way. The code is never logged or written anywhere.
 import AppKit
 import ApplicationServices
 import Foundation
 
 let dailyChromeBundle = "com.google.Chrome"
-let icloudExtensionID = "pejdijmoenmkgeppbflobdenhhabjlaj"
-let popupPath = "\(icloudExtensionID)/page_popup.html"
 
 func ax(_ e: AXUIElement, _ k: String) -> CFTypeRef? {
   var v: CFTypeRef?
@@ -27,10 +27,10 @@ func ax(_ e: AXUIElement, _ k: String) -> CFTypeRef? {
 }
 func axS(_ e: AXUIElement, _ k: String) -> String? { ax(e, k) as? String }
 func axKids(_ e: AXUIElement) -> [AXUIElement] { (ax(e, kAXChildrenAttribute) as? [AXUIElement]) ?? [] }
-func axURL(_ e: AXUIElement) -> String? {
-  guard let u = ax(e, "AXURL") else { return nil }
-  if CFGetTypeID(u) == CFURLGetTypeID() { return (u as! URL).absoluteString }
-  return u as? String
+func axSize(_ e: AXUIElement) -> CGSize? {
+  guard let v = ax(e, kAXSizeAttribute) else { return nil }
+  var s = CGSize.zero
+  return AXValueGetValue(v as! AXValue, .cgSize, &s) ? s : nil
 }
 
 /// "<page> - Google Chrome - <profile>" -> "<profile>"; a title without a profile suffix -> "".
@@ -39,60 +39,44 @@ func chromeWindowLabel(_ title: String) -> String {
   return String(title[r.upperBound...])
 }
 
-struct Popup {
-  let webArea: AXUIElement
-  let pins: [AXUIElement]  // PIN0..PIN5 in order when the PIN box is showing, else empty
-  let dismiss: AXUIElement?
+enum PopupState: Equatable { case asking, paired, other(String) }
+
+/// What the iCloud Passwords popup shows, from its OCR text (tests: --popup-state).
+func popupState(_ text: String) -> PopupState {
+  if text.contains("Enable Password AutoFill") || text.contains("Enable Password Autofill") { return .asking }
+  if text.contains("synced with iCloud") || text.contains("Open Passwords") || text.contains("Choose an account") {
+    return .paired
+  }
+  return .other(text.replacingOccurrences(of: #"\d"#, with: "#", options: .regularExpression)
+    .replacingOccurrences(of: "\n", with: " | ").prefix(120).description)
 }
 
-/// The extension popup's web area. Never descends into other web areas, so a big page is not walked.
-func findPopupWebArea(_ e: AXUIElement, _ depth: Int) -> AXUIElement? {
-  if depth > 40 { return nil }
-  if axS(e, kAXRoleAttribute) == "AXWebArea" { return (axURL(e) ?? "").contains(popupPath) ? e : nil }
-  for k in axKids(e) { if let w = findPopupWebArea(k, depth + 1) { return w } }
-  return nil
-}
-
-func webAreaOf(_ e: AXUIElement) -> AXUIElement? {
-  var cur: AXUIElement? = e
-  for _ in 0..<40 {
-    guard let c = cur else { return nil }
-    if axS(c, kAXRoleAttribute) == "AXWebArea" { return c }
-    cur = ax(c, kAXParentAttribute).map { $0 as! AXUIElement }
+/// Chrome's extension popup: an on-screen Chrome window much smaller than a browser window.
+func popupWindow(_ pid: pid_t) -> (id: CGWindowID, size: CGSize)? {
+  let info = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []
+  for w in info where (w[kCGWindowOwnerPID as String] as? pid_t) == pid && (w[kCGWindowLayer as String] as? Int) == 0 {
+    guard let b = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: b),
+      let id = w[kCGWindowNumber as String] as? CGWindowID
+    else { continue }
+    if r.width >= 200, r.width <= 520, r.height >= 60, r.height <= 600 { return (id, r.size) }
   }
   return nil
 }
 
-func popupFrom(_ area: AXUIElement) -> Popup {
-  var byID: [String: AXUIElement] = [:]
-  func walk(_ e: AXUIElement, _ d: Int) {
-    if d > 30 { return }
-    if let id = axS(e, "AXDOMIdentifier"), id.hasPrefix("PIN") || id == "dismiss" { byID[id] = e }
-    for k in axKids(e) { walk(k, d + 1) }
+func toolbarButton(_ window: AXUIElement) -> AXUIElement? {
+  func find(_ e: AXUIElement, _ d: Int) -> AXUIElement? {
+    if d > 20 { return nil }
+    let role = axS(e, kAXRoleAttribute) ?? ""
+    if role == "AXWebArea" { return nil }
+    if role == "AXPopUpButton" || role == "AXButton",
+      [kAXTitleAttribute, kAXDescriptionAttribute].contains(where: { (axS(e, $0) ?? "").hasPrefix("iCloud Passwords") })
+    {
+      return e
+    }
+    for k in axKids(e) { if let b = find(k, d + 1) { return b } }
+    return nil
   }
-  walk(area, 0)
-  let pins = (0..<6).compactMap { byID["PIN\($0)"] }
-  return Popup(webArea: area, pins: pins.count == 6 ? pins : [], dismiss: byID["dismiss"])
-}
-
-func findPopup(_ app: AXUIElement) -> Popup? {
-  if let f = ax(app, kAXFocusedUIElementAttribute), let area = webAreaOf(f as! AXUIElement),
-    (axURL(area) ?? "").contains(popupPath)
-  {
-    return popupFrom(area)
-  }
-  for w in (ax(app, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
-    if let area = findPopupWebArea(w, 0) { return popupFrom(area) }
-  }
-  return nil
-}
-
-/// Chrome's focused element is PIN<i> inside the iCloud Passwords popup.
-func focusIsPin(_ app: AXUIElement, _ i: Int) -> Bool {
-  guard let f = ax(app, kAXFocusedUIElementAttribute) else { return false }
-  let el = f as! AXUIElement
-  guard axS(el, "AXDOMIdentifier") == "PIN\(i)", let area = webAreaOf(el) else { return false }
-  return (axURL(area) ?? "").contains(popupPath)
+  return find(window, 0)
 }
 
 let digitKeyCodes: [Character: CGKeyCode] = [
@@ -109,7 +93,7 @@ func postDigit(_ ch: Character, to pid: pid_t) {
     var u = Array(String(ch).utf16)
     ev.keyboardSetUnicodeString(stringLength: u.count, unicodeString: &u)
     ev.postToPid(pid)
-    usleep(15000)
+    usleep(20000)
   }
 }
 
@@ -119,51 +103,9 @@ func waitUntil(_ seconds: Double, _ cond: () -> Bool) -> Bool {
   let end = Date().addingTimeInterval(seconds)
   while Date() < end {
     if cond() { return true }
-    spin(0.05)
+    spin(0.1)
   }
   return cond()
-}
-
-/// Types the code into the popup's six fields. Every keystroke is preceded by a check that Chrome's focused
-/// element is the field it belongs in; any doubt stops typing.
-func fillPIN(_ code: String, pid: pid_t, app: AXUIElement, popup: Popup) -> Bool {
-  let digits = Array(code)
-  guard digits.count == 6, popup.pins.count == 6 else { return false }
-  for i in 0..<6 {
-    let field = popup.pins[i]
-    if !focusIsPin(app, i) {
-      AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-      _ = waitUntil(0.5) { focusIsPin(app, i) }
-    }
-    guard focusIsPin(app, i) else { log("chrome: PIN field \(i + 1) would not take focus; typed nothing more"); return false }
-    postDigit(digits[i], to: pid)
-    let landed = waitUntil(1.5) {
-      (axS(field, kAXValueAttribute) ?? "").count == 1 || (ax(field, kAXEnabledAttribute) as? Bool) == false
-    }
-    guard landed else { log("chrome: keystroke \(i + 1) did not reach the PIN field; typed nothing more"); return false }
-  }
-  return true
-}
-
-enum Press { case pressed, missing, failed(AXError) }
-
-/// The pinned toolbar button; Chrome titles it "iCloud Passwords\nHas access to this site".
-func pressToolbarButton(_ window: AXUIElement) -> Press {
-  func find(_ e: AXUIElement, _ d: Int) -> AXUIElement? {
-    if d > 20 { return nil }
-    let role = axS(e, kAXRoleAttribute) ?? ""
-    if role == "AXWebArea" { return nil }
-    if role == "AXPopUpButton" || role == "AXButton",
-      [kAXTitleAttribute, kAXDescriptionAttribute].contains(where: { (axS(e, $0) ?? "").hasPrefix("iCloud Passwords") })
-    {
-      return e
-    }
-    for k in axKids(e) { if let b = find(k, d + 1) { return b } }
-    return nil
-  }
-  guard let b = find(window, 0) else { return .missing }
-  let err = AXUIElementPerformAction(b, kAXPressAction as CFString)
-  return err == .success ? .pressed : .failed(err)
 }
 
 func idleSeconds() -> Double {
@@ -172,44 +114,76 @@ func idleSeconds() -> Double {
   }.min() ?? 0
 }
 
-/// Roles and DOM ids of the popup, never values (a field may hold a digit of the code).
-func describePopup(_ p: Popup) -> String {
-  var out: [String] = []
-  func walk(_ e: AXUIElement, _ d: Int) {
-    if d > 12 || out.count > 60 { return }
-    out.append("\(String(repeating: " ", count: d))\(axS(e, kAXRoleAttribute) ?? "?")#\(axS(e, "AXDOMIdentifier") ?? "")")
-    for k in axKids(e) { walk(k, d + 1) }
-  }
-  walk(p.webArea, 0)
-  return "url=\(axURL(p.webArea) ?? "?") pins=\(p.pins.count) dismiss=\(p.dismiss != nil)\n" + out.joined(separator: "\n")
-}
-
-func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
+func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
   dump = false  // the shared AX/OCR readers print window text, which holds the code; this mode never does
   log("chrome: watching \(dailyChromeBundle) for iCloud Passwords pairing\(dryRun ? " (dry run: never presses or types)" : "")")
   var chromePid: pid_t = 0
   var app = AXUIElementCreateApplication(0)
-  var webAX = false
   var known = Set<pid_t>()
-  var paired = Set<String>()  // profile labels paired since the extension last (re)connected
-  var presses: [String: (n: Int, at: Date)] = [:]
-  var pressedLabel: (label: String, at: Date)?
-  var codeSeen: [pid_t: Date] = [:]
-  var attempts: [pid_t: Int] = [:]
+  var paired = Set<String>()  // profile labels seen paired since the extension last (re)connected
+  var tries: [String: (n: Int, at: Date)] = [:]
+  var typed = Set<pid_t>()  // helpers whose current code window was already typed once
   var lastNote = ""
-  /// Logs a decision only when it changes, so a waiting watcher writes one line, not one per tick.
   func note(_ s: String) { if s != lastNote { log("chrome: \(s)"); lastNote = s } }
 
-  func setWebAX(_ on: Bool) {
-    guard webAX != on else { return }
-    AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, on ? kCFBooleanTrue : kCFBooleanFalse)
-    webAX = on
+  func frontmost() -> Bool { (ax(app, "AXFrontmost") as? Bool) == true }
+  func standardWindows() -> [(win: AXUIElement, label: String)] {
+    ((ax(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []).compactMap { w in
+      guard axS(w, kAXSubroleAttribute) == "AXStandardWindow", let t = axS(w, kAXTitleAttribute) else { return nil }
+      let l = chromeWindowLabel(t)
+      return l.isEmpty ? nil : (w, l)
+    }
   }
   func mainLabel() -> String? {
-    guard let w = ax(app, kAXMainWindowAttribute) else { return nil }
-    let win = w as! AXUIElement
-    guard axS(win, kAXSubroleAttribute) == "AXStandardWindow", let t = axS(win, kAXTitleAttribute) else { return nil }
-    return chromeWindowLabel(t)
+    guard let w = ax(app, kAXMainWindowAttribute), let t = axS(w as! AXUIElement, kAXTitleAttribute) else { return nil }
+    let l = chromeWindowLabel(t)
+    return l.isEmpty ? nil : l
+  }
+  /// Chrome is in front and its focused window is the popup (same size as the on-screen popup window).
+  func popupHasFocus(_ size: CGSize) -> Bool {
+    guard frontmost(), let f = ax(app, kAXFocusedWindowAttribute) else { return false }
+    let w = f as! AXUIElement
+    guard axS(w, kAXSubroleAttribute) != "AXStandardWindow", let s = axSize(w) else { return false }
+    return abs(s.width - size.width) < 2 && abs(s.height - size.height) < 2
+  }
+  func codeWindowHelpers() -> [pid_t] { helperPids(parents: [chromePid]).filter { !windowIDs($0).isEmpty } }
+  func readPopup() -> PopupState? {
+    guard let p = popupWindow(chromePid), let t = windowText(p.id) else { return nil }
+    return popupState(t)
+  }
+
+  /// The popup asks and helper `h` shows its code window: type the code. Returns true when paired.
+  func typeCode(helper h: pid_t, label: String) -> Bool {
+    let started = Date()
+    guard let pop = popupWindow(chromePid) else { note("code window up (helper \(h)); no popup open"); return false }
+    guard readPopup() == .asking else { note("code window up (helper \(h)); popup not asking"); return false }
+    guard let code = viaAX(h) ?? windowIDs(h).lazy.compactMap(viaOCR).first, code.count == 6 else {
+      note("code window up (helper \(h)); no code readable by AX or OCR"); return false
+    }
+    typed.insert(h)
+    if dryRun { log("chrome: dry run: would type the code into profile '\(label)' popup"); return false }
+    for (i, ch) in code.enumerated() {
+      guard waitUntil(1.5, { popupHasFocus(pop.size) }) else {
+        log("chrome: popup lost focus before digit \(i + 1); typed nothing more"); return false
+      }
+      postDigit(ch, to: chromePid)
+      spin(0.08)
+    }
+    let ok = waitUntil(10) { windowIDs(h).isEmpty && (popupWindow(chromePid) == nil || readPopup() != .asking) }
+    let ms = Int(Date().timeIntervalSince(started) * 1000)
+    if ok {
+      paired.insert(label)
+      log("chrome: paired profile '\(label)' with no human (\(ms) ms from code window to paired)")
+      // A popup still open now shows "synced"; pressing the same button closes it.
+      if popupWindow(chromePid) != nil, readPopup() == .paired,
+        let w = standardWindows().first(where: { $0.label == label }), let b = toolbarButton(w.win)
+      {
+        AXUIElementPerformAction(b, kAXPressAction as CFString)
+      }
+    } else {
+      log("chrome: typed the code for profile '\(label)' but it is still asking (\(ms) ms)")
+    }
+    return ok
   }
 
   while true {
@@ -224,94 +198,71 @@ func watchChrome(dryRun: Bool, dump showPopup: Bool) -> Never {
     if chrome.processIdentifier != chromePid {
       chromePid = chrome.processIdentifier
       app = AXUIElementCreateApplication(chromePid)
-      webAX = false
-      known = []; paired = []; presses = [:]; codeSeen = [:]; attempts = [:]; pressedLabel = nil; lastNote = ""
+      known = []; paired = []; tries = [:]; typed = []; lastNote = ""
       log("chrome: Google Chrome running (pid \(chromePid))")
     }
     let helpers = Set(helperPids(parents: [chromePid]))
     if !helpers.subtracting(known).isEmpty {
-      log("chrome: iCloud Passwords extension connected to Apple's helper (pids \(helpers.sorted())); pairing needed")
-      paired = []; presses = [:]
+      log("chrome: extension connected to Apple's helper (pids \(helpers.sorted())); checking each profile")
+      paired = []; tries = [:]
     }
     known = helpers
+    typed.formIntersection(Set(codeWindowHelpers()))
 
-    // A code window from a helper of THIS Chrome: fill it into the popup.
-    let showing = helpers.filter { !windowIDs($0).isEmpty }
-    for h in showing where codeSeen[h] == nil { codeSeen[h] = Date() }
-    for h in Array(codeSeen.keys) where !showing.contains(h) { codeSeen[h] = nil; attempts[h] = nil }
-    if let h = showing.max(by: { codeSeen[$0]! < codeSeen[$1]! }) {
-      guard (attempts[h] ?? 0) < 2 else { note("code window of helper \(h) still up after 2 tries; leaving it to Sammy"); continue }
-      setWebAX(true)
-      guard let popup = findPopup(app) else { note("code window up (helper \(h)); no iCloud Passwords popup found in Chrome's AX tree"); continue }
-      guard popup.pins.count == 6 else { note("code window up (helper \(h)); popup found, PIN boxes not (\(popup.pins.count)/6)"); continue }
-      guard popup.pins.allSatisfy({ (ax($0, kAXEnabledAttribute) as? Bool) != false }),
-        (axS(popup.pins[0], kAXValueAttribute) ?? "").isEmpty
-      else { note("code window up (helper \(h)); PIN boxes already filled or disabled"); continue }
-      if showPopup { log("chrome: popup \(describePopup(popup))") }
-      guard let code = viaAX(h) ?? windowIDs(h).lazy.compactMap(viaOCR).first else {
-        note("code window up (helper \(h)); no code readable by AX or OCR"); continue
-      }
-      note("code window up (helper \(h)); popup asking; typing")
-      attempts[h, default: 0] += 1
-      let label = pressedLabel.flatMap { Date().timeIntervalSince($0.at) < 60 ? $0.label : nil } ?? mainLabel() ?? ""
-      if dryRun { log("chrome: dry run: would type the code into profile '\(label)' popup"); attempts[h] = 2; continue }
-      guard fillPIN(code, pid: chromePid, app: app, popup: popup) else { continue }
-      let ok = waitUntil(10) {
-        guard let p = findPopup(app) else { return true }
-        return p.pins.isEmpty
-      }
-      let ms = Int(Date().timeIntervalSince(codeSeen[h] ?? Date()) * 1000)
-      if ok {
-        paired.insert(label)
-        pressedLabel = nil
-        log("chrome: paired Google Chrome profile '\(label)' with no human, \(ms) ms after the code window appeared")
-        setWebAX(false)
-      } else {
-        log("chrome: typed the code for profile '\(label)' but the popup still asks for it (\(ms) ms)")
-      }
+    // A code window for this Chrome (ours or one Sammy summoned): fill the open popup.
+    if let h = codeWindowHelpers().first(where: { !typed.contains($0) }) {
+      guard idleSeconds() >= 1 else { note("code window up; waiting for Sammy to stop typing"); continue }
+      _ = typeCode(helper: h, label: mainLabel() ?? "?")
       continue
     }
+    guard codeWindowHelpers().isEmpty else { note("code window still up after one try; leaving it to Sammy"); continue }
 
-    // No code window: open the popup ourselves when the front window's profile is not paired yet.
+    // No code window: check each profile window not known paired, one press at a time.
     guard !helpers.isEmpty else { note("waiting: extension not connected to Apple's helper"); continue }
-    // AXFrontmost asks Chrome itself; NSRunningApplication.isActive is a cached copy.
-    guard (ax(app, "AXFrontmost") as? Bool) == true else { note("waiting: Chrome not in front"); continue }
-    guard let label = mainLabel() else { note("waiting: no standard Chrome window in front"); continue }
-    guard !paired.contains(label) else { note("waiting: profile '\(label)' paired"); continue }
-    guard idleSeconds() >= 2 else { note("waiting: Sammy active (profile '\(label)' unpaired)"); continue }
-    let prev = presses[label] ?? (0, .distantPast)
-    guard prev.n < 6 else { note("gave up pressing in profile '\(label)' after 6 tries; click iCloud Passwords once"); continue }
-    guard Date().timeIntervalSince(prev.at) > 20 else { continue }
-    setWebAX(true)
-    if let p = findPopup(app) { note("popup already open (PIN boxes \(p.pins.count)/6); waiting for the code window"); continue }
-    presses[label] = (prev.n + 1, Date())
-    if dryRun { log("chrome: dry run: would press iCloud Passwords in profile '\(label)'"); continue }
-    guard let w = ax(app, kAXMainWindowAttribute) else { continue }
-    switch pressToolbarButton(w as! AXUIElement) {
-    case .pressed: break
-    case .missing:
-      log("chrome: no pinned iCloud Passwords button in profile '\(label)' front window")
-      presses[label] = (3, Date())
-      continue
-    case .failed(let err):
-      log("chrome: pressing iCloud Passwords in profile '\(label)' failed (AXError \(err.rawValue))")
+    let todo = standardWindows().filter { !paired.contains($0.label) }
+    var seen = Set<String>()
+    guard let next = todo.first(where: { seen.insert($0.label).inserted && (tries[$0.label]?.n ?? 0) < 4
+      && Date().timeIntervalSince(tries[$0.label]?.at ?? .distantPast) > 20 })
+    else {
+      if todo.isEmpty { note("all open profiles paired") }
+      else if todo.allSatisfy({ (tries[$0.label]?.n ?? 0) >= 4 }) {
+        note("gave up on \(Set(todo.map(\.label)).sorted()) after 4 tries each; click iCloud Passwords once there")
+      }
       continue
     }
-    pressedLabel = (label, Date())
-    log("chrome: pressed iCloud Passwords in profile '\(label)' (try \(prev.n + 1))")
-    let challenged = waitUntil(5) { Set(helperPids(parents: [chromePid])).contains { !windowIDs($0).isEmpty } }
-    if challenged { log("chrome: code window appeared after the press"); continue }  // the next pass types the code
-    if let p = findPopup(app) {
-      if p.pins.isEmpty {
-        paired.insert(label)
-        if let d = p.dismiss { AXUIElementPerformAction(d, kAXPressAction as CFString) }
-        log("chrome: profile '\(label)' is already paired")
-        setWebAX(false)
-      } else {
-        log("chrome: popup open with PIN boxes \(p.pins.count)/6 but no code window within 5 s")
+    guard frontmost() else { note("waiting: Chrome not in front (unchecked: \(Set(todo.map(\.label)).sorted()))"); continue }
+    guard idleSeconds() >= 2 else { note("waiting: Sammy active (unchecked: \(Set(todo.map(\.label)).sorted()))"); continue }
+    guard popupWindow(chromePid) == nil else { note("waiting: a popup is already open"); continue }
+    let label = next.label
+    tries[label] = ((tries[label]?.n ?? 0) + 1, Date())
+    guard let b = toolbarButton(next.win) else {
+      note("no pinned iCloud Passwords button in profile '\(label)'; pin it once"); tries[label] = (4, Date()); continue
+    }
+    if dryRun { note("dry run: would press iCloud Passwords in profile '\(label)'"); continue }
+    let err = AXUIElementPerformAction(b, kAXPressAction as CFString)
+    guard err == .success else { log("chrome: pressing iCloud Passwords in '\(label)' failed (AXError \(err.rawValue))"); continue }
+    guard waitUntil(3, { popupWindow(chromePid) != nil }) else {
+      log("chrome: pressed iCloud Passwords in '\(label)' (try \(tries[label]!.n)); no popup window appeared"); continue
+    }
+    spin(0.6)  // let the popup render before reading it
+    var state = readPopup()
+    if state != .asking && state != .paired { spin(1.5); state = readPopup() }
+    switch state {
+    case .paired?:
+      paired.insert(label)
+      if popupWindow(chromePid) != nil { AXUIElementPerformAction(b, kAXPressAction as CFString) }
+      log("chrome: profile '\(label)' is paired")
+    case .asking?:
+      log("chrome: profile '\(label)' asks for the code (try \(tries[label]!.n)); waiting for Apple's code window")
+      guard let h = waitUntil(6, { !codeWindowHelpers().isEmpty }) ? codeWindowHelpers().first : nil else {
+        log("chrome: no code window appeared for '\(label)'"); continue
       }
-    } else {
-      log("chrome: press gave no popup in Chrome's AX tree within 5 s")
+      _ = typeCode(helper: h, label: label)
+    case .other(let t)?:
+      log("chrome: popup in '\(label)' shows neither state: \(t)")
+      if popupWindow(chromePid) != nil { AXUIElementPerformAction(b, kAXPressAction as CFString) }
+    case nil:
+      log("chrome: popup in '\(label)' closed before it could be read")
     }
   }
 }

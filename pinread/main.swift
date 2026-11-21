@@ -7,6 +7,7 @@
 //   apw-pinread [--dump] [--no-send] [--timeout <s>]   exit 0 sent (or printed with --no-send); 1 no code; 2 send failed
 //   apw-pinread --parse <text>                         print the code found in <text> (tests)
 //   apw-pinread --window-label <title>                 print the Chrome profile label of a window title (tests)
+//   apw-pinread --popup-state <ocr text>               asking | paired | other for the extension popup (tests)
 //   apw-pinread --watch-chrome [--dry-run] [--dump]    keep the everyday Google Chrome paired (chrome.swift);
 //                                                      runs as launchd job com.lod.apw-chromepair
 //   apw-pinread --save-click                           press Apple's save alert for one `apw pw save` (saveclick.swift);
@@ -19,7 +20,7 @@ import Vision
 let helperName = "PasswordManagerBrowserExtensionHelper"
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 var dump = false, send = true, timeout = 30.0
-var parseText: String?, labelText: String?
+var parseText: String?, labelText: String?, popupText: String?
 var watch = false, dryRun = false, saveClick = false
 var classifyArgs: [String]?
 var args = CommandLine.arguments.dropFirst().makeIterator()
@@ -30,6 +31,7 @@ while let a = args.next() {
   case "--timeout": if let v = args.next(), let t = Double(v) { timeout = t }
   case "--parse": parseText = args.next() ?? ""
   case "--window-label": labelText = args.next() ?? ""
+  case "--popup-state": popupText = args.next() ?? ""
   case "--watch-chrome": watch = true
   case "--dry-run": dryRun = true
   case "--save-click": saveClick = true
@@ -51,6 +53,10 @@ func code(in text: String) -> String? {
 }
 if let t = parseText { if let c = code(in: t) { print(c); exit(0) }; exit(1) }
 if let t = labelText { print(chromeWindowLabel(t)); exit(0) }
+if let t = popupText {
+  switch popupState(t) { case .asking: print("asking"); case .paired: print("paired"); case .other: print("other") }
+  exit(0)
+}
 if let a = classifyArgs { classifyAlertCLI(a) }
 
 func parentPid(_ pid: pid_t) -> pid_t? {
@@ -109,7 +115,8 @@ func windowIDs(_ pid: pid_t) -> [CGWindowID] {
   }
 }
 
-func viaOCR(_ wid: CGWindowID) -> String? {
+/// All text Vision reads in one on-screen window (screencapture of that window only).
+func windowText(_ wid: CGWindowID) -> String? {
   let url = FileManager.default.temporaryDirectory.appendingPathComponent("apw-pin-\(getpid())-\(wid).png")
   defer { try? FileManager.default.removeItem(at: url) }
   let p = Process()
@@ -122,7 +129,11 @@ func viaOCR(_ wid: CGWindowID) -> String? {
   req.recognitionLevel = .accurate
   req.usesLanguageCorrection = false
   try? VNImageRequestHandler(cgImage: cg).perform([req])
-  let text = (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+  return (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+}
+
+func viaOCR(_ wid: CGWindowID) -> String? {
+  guard let text = windowText(wid) else { return nil }
   if dump { log("ocr[window \(wid)] text=\(text.debugDescription)") }
   return text.contains("AutoFill") || text.contains("Verification") ? code(in: text) : nil
 }
