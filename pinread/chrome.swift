@@ -9,10 +9,12 @@
 //     never reads a code. Apple's code window belongs to a PasswordManagerBrowserExtensionHelper whose parent is
 //     this Chrome (one helper per profile); apw's Chrome Beta helpers never match.
 //   - The popup focuses its first PIN box itself and submits on the 6th digit keydown (an AXValue set never would).
-// Loop: for each profile window not yet known paired, once the user is idle and Chrome is in front: press its
-// button, OCR the popup. Paired -> close it (press again). Asking -> wait for Apple's code window, read the code
-// (AX, else OCR of that window), and post the six digit keys to the Chrome process only (CGEvent.postToPid),
-// checking before EVERY key that Chrome is frontmost and its focused window is that popup. Done when the code
+// Loop: for each profile window not yet known paired, once Chrome is in front and the user idle 2 s (a press with
+// another app in front pulls Chrome forward, measured 2026-11-21, so it never presses from the background): press
+// its button, OCR the popup. Paired -> close it (press again). Asking -> wait for Apple's code window, type when
+// Chrome is in front again. Then reopen the popup if Chrome closed it,
+// read the code (AX, else OCR of that window), and post the six digit keys to the Chrome process only
+// (CGEvent.postToPid), checking before EVERY key that Chrome is frontmost and its focused window is that popup. Done when the code
 // window closes and the popup stops asking. A code window Sammy summoned himself (in-page prompt) is filled the
 // same way. The code is never logged or written anywhere.
 import AppKit
@@ -122,11 +124,19 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
   var known = Set<pid_t>()
   var paired = Set<String>()  // profile labels seen paired since the extension last (re)connected
   var tries: [String: (n: Int, at: Date)] = [:]
-  var typed = Set<pid_t>()  // helpers whose current code window was already typed once
-  var lastNote = ""
+  var typed: [pid_t: Int] = [:]  // helper -> times its current code window was typed
+  var pending: String?  // profile whose popup asked for the code
+  var lastNote = "", lastFront = ""
   func note(_ s: String) { if s != lastNote { log("chrome: \(s)"); lastNote = s } }
 
-  func frontmost() -> Bool { (ax(app, "AXFrontmost") as? Bool) == true }
+  /// Chrome is the active app. Two independent reads; their raw values are logged whenever they change.
+  func frontmost() -> Bool {
+    let axv = ax(app, "AXFrontmost") as? Bool
+    let ws = NSWorkspace.shared.frontmostApplication?.processIdentifier == chromePid
+    let raw = "AXFrontmost=\(axv.map(String.init) ?? "nil") NSWorkspace.front=\(ws)"
+    if raw != lastFront { log("chrome: front signals \(raw)"); lastFront = raw }
+    return axv == true || ws
+  }
   func standardWindows() -> [(win: AXUIElement, label: String)] {
     ((ax(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []).compactMap { w in
       guard axS(w, kAXSubroleAttribute) == "AXStandardWindow", let t = axS(w, kAXTitleAttribute) else { return nil }
@@ -138,6 +148,9 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     guard let w = ax(app, kAXMainWindowAttribute), let t = axS(w as! AXUIElement, kAXTitleAttribute) else { return nil }
     let l = chromeWindowLabel(t)
     return l.isEmpty ? nil : l
+  }
+  func button(_ label: String) -> AXUIElement? {
+    standardWindows().first(where: { $0.label == label }).flatMap { toolbarButton($0.win) }
   }
   /// Chrome is in front and its focused window is the popup (same size as the on-screen popup window).
   func popupHasFocus(_ size: CGSize) -> Bool {
@@ -151,16 +164,26 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     guard let p = popupWindow(chromePid), let t = windowText(p.id) else { return nil }
     return popupState(t)
   }
+  func closePopup(_ label: String) {
+    if popupWindow(chromePid) != nil, let b = button(label) { AXUIElementPerformAction(b, kAXPressAction as CFString) }
+  }
 
-  /// The popup asks and helper `h` shows its code window: type the code. Returns true when paired.
+  /// Chrome is in front, Sammy idle, helper `h` shows its code window: make sure `label`'s popup is open and
+  /// asking, then type the code. Returns true when paired.
   func typeCode(helper h: pid_t, label: String) -> Bool {
     let started = Date()
-    guard let pop = popupWindow(chromePid) else { note("code window up (helper \(h)); no popup open"); return false }
-    guard readPopup() == .asking else { note("code window up (helper \(h)); popup not asking"); return false }
+    if popupWindow(chromePid) == nil {  // Chrome closes the popup when it loses focus; reopening shows the PIN boxes
+      guard let b = button(label) else { note("code window up; no iCloud Passwords button for '\(label)'"); return false }
+      AXUIElementPerformAction(b, kAXPressAction as CFString)
+      guard waitUntil(3, { popupWindow(chromePid) != nil }) else { note("code window up; popup for '\(label)' would not open"); return false }
+      spin(0.6)
+    }
+    guard let pop = popupWindow(chromePid) else { return false }
+    guard readPopup() == .asking else { note("code window up (helper \(h)); the open popup is not asking"); return false }
     guard let code = viaAX(h) ?? windowIDs(h).lazy.compactMap(viaOCR).first, code.count == 6 else {
       note("code window up (helper \(h)); no code readable by AX or OCR"); return false
     }
-    typed.insert(h)
+    typed[h, default: 0] += 1
     if dryRun { log("chrome: dry run: would type the code into profile '\(label)' popup"); return false }
     for (i, ch) in code.enumerated() {
       guard waitUntil(1.5, { popupHasFocus(pop.size) }) else {
@@ -173,13 +196,9 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     let ms = Int(Date().timeIntervalSince(started) * 1000)
     if ok {
       paired.insert(label)
-      log("chrome: paired profile '\(label)' with no human (\(ms) ms from code window to paired)")
-      // A popup still open now shows "synced"; pressing the same button closes it.
-      if popupWindow(chromePid) != nil, readPopup() == .paired,
-        let w = standardWindows().first(where: { $0.label == label }), let b = toolbarButton(w.win)
-      {
-        AXUIElementPerformAction(b, kAXPressAction as CFString)
-      }
+      pending = nil
+      log("chrome: paired profile '\(label)' with no human (\(ms) ms from typing start to paired)")
+      if readPopup() == .paired { closePopup(label) }
     } else {
       log("chrome: typed the code for profile '\(label)' but it is still asking (\(ms) ms)")
     }
@@ -198,7 +217,7 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     if chrome.processIdentifier != chromePid {
       chromePid = chrome.processIdentifier
       app = AXUIElementCreateApplication(chromePid)
-      known = []; paired = []; tries = [:]; typed = []; lastNote = ""
+      known = []; paired = []; tries = [:]; typed = [:]; pending = nil; lastNote = ""; lastFront = ""
       log("chrome: Google Chrome running (pid \(chromePid))")
     }
     let helpers = Set(helperPids(parents: [chromePid]))
@@ -207,17 +226,22 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       paired = []; tries = [:]
     }
     known = helpers
-    typed.formIntersection(Set(codeWindowHelpers()))
+    let showing = codeWindowHelpers()
+    typed = typed.filter { showing.contains($0.key) }
 
-    // A code window for this Chrome (ours or one Sammy summoned): fill the open popup.
-    if let h = codeWindowHelpers().first(where: { !typed.contains($0) }) {
-      guard idleSeconds() >= 1 else { note("code window up; waiting for Sammy to stop typing"); continue }
-      _ = typeCode(helper: h, label: mainLabel() ?? "?")
+    // A code window for this Chrome (ours or one Sammy summoned): typing is the one step that needs Chrome in front.
+    if let h = showing.first(where: { (typed[$0] ?? 0) < 2 }) {
+      let label = pending ?? mainLabel() ?? "?"
+      guard frontmost(), idleSeconds() >= 1 else {
+        note("code ready for '\(label)': Chrome needs you in front, hands off, for 3 s"); continue
+      }
+      _ = typeCode(helper: h, label: label)
       continue
     }
-    guard codeWindowHelpers().isEmpty else { note("code window still up after one try; leaving it to Sammy"); continue }
+    guard showing.isEmpty else { note("code window still up after two tries; leaving it to Sammy"); continue }
 
-    // No code window: check each profile window not known paired, one press at a time.
+    // No code window: check each profile not known paired, one press at a time. Measured 2026-11-21: a press while
+    // another app is in front brings Chrome to the front, so presses wait until Sammy has Chrome in front himself.
     guard !helpers.isEmpty else { note("waiting: extension not connected to Apple's helper"); continue }
     let todo = standardWindows().filter { !paired.contains($0.label) }
     var seen = Set<String>()
@@ -230,8 +254,9 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       }
       continue
     }
-    guard frontmost() else { note("waiting: Chrome not in front (unchecked: \(Set(todo.map(\.label)).sorted()))"); continue }
-    guard idleSeconds() >= 2 else { note("waiting: Sammy active (unchecked: \(Set(todo.map(\.label)).sorted()))"); continue }
+    let unchecked = Set(todo.map(\.label)).sorted()
+    guard frontmost() else { note("waiting: Chrome in front, hands off for 2 s, to check \(unchecked)"); continue }
+    guard idleSeconds() >= 2 else { note("waiting: Sammy active in Chrome (unchecked: \(unchecked))"); continue }
     guard popupWindow(chromePid) == nil else { note("waiting: a popup is already open"); continue }
     let label = next.label
     tries[label] = ((tries[label]?.n ?? 0) + 1, Date())
@@ -239,30 +264,30 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       note("no pinned iCloud Passwords button in profile '\(label)'; pin it once"); tries[label] = (4, Date()); continue
     }
     if dryRun { note("dry run: would press iCloud Passwords in profile '\(label)'"); continue }
+    let wasFront = frontmost()
     let err = AXUIElementPerformAction(b, kAXPressAction as CFString)
     guard err == .success else { log("chrome: pressing iCloud Passwords in '\(label)' failed (AXError \(err.rawValue))"); continue }
     guard waitUntil(3, { popupWindow(chromePid) != nil }) else {
-      log("chrome: pressed iCloud Passwords in '\(label)' (try \(tries[label]!.n)); no popup window appeared"); continue
+      log("chrome: pressed iCloud Passwords in '\(label)' (try \(tries[label]!.n), Chrome front before: \(wasFront)); no popup window appeared"); continue
     }
     spin(0.6)  // let the popup render before reading it
     var state = readPopup()
     if state != .asking && state != .paired { spin(1.5); state = readPopup() }
+    let ctx = "Chrome front before: \(wasFront), after: \(frontmost())"
     switch state {
     case .paired?:
       paired.insert(label)
-      if popupWindow(chromePid) != nil { AXUIElementPerformAction(b, kAXPressAction as CFString) }
-      log("chrome: profile '\(label)' is paired")
+      closePopup(label)
+      log("chrome: profile '\(label)' is paired (\(ctx))")
     case .asking?:
-      log("chrome: profile '\(label)' asks for the code (try \(tries[label]!.n)); waiting for Apple's code window")
-      guard let h = waitUntil(6, { !codeWindowHelpers().isEmpty }) ? codeWindowHelpers().first : nil else {
-        log("chrome: no code window appeared for '\(label)'"); continue
-      }
-      _ = typeCode(helper: h, label: label)
+      pending = label
+      log("chrome: profile '\(label)' asks for the code (try \(tries[label]!.n), \(ctx)); waiting for Apple's code window")
+      if !waitUntil(6, { !codeWindowHelpers().isEmpty }) { log("chrome: no code window appeared for '\(label)'") }
     case .other(let t)?:
-      log("chrome: popup in '\(label)' shows neither state: \(t)")
-      if popupWindow(chromePid) != nil { AXUIElementPerformAction(b, kAXPressAction as CFString) }
+      log("chrome: popup in '\(label)' shows neither state (\(ctx)): \(t)")
+      closePopup(label)
     case nil:
-      log("chrome: popup in '\(label)' closed before it could be read")
+      log("chrome: popup in '\(label)' closed before it could be read (\(ctx))")
     }
   }
 }
