@@ -3,13 +3,15 @@
 #   scripts/install-local.sh            build + test + install to $APW_PREFIX (default ~/.local/opt/apw/bin)
 #   --link                              also point /opt/homebrew/bin/apw at it (brew unlink apw first; undo: brew link apw)
 # Installs launchd jobs com.lod.apw-pinread (on demand: the daemon kickstarts it when apw is unpaired) and
-# com.lod.apw-chromepair (always on: types the iCloud Passwords code into the everyday Chrome, see pinread/chrome.swift).
+# com.lod.apw-chromepair (always on: types the iCloud Passwords code into the everyday Chrome, see pinread/chrome.swift)
+# and com.lod.apw-saveclick (on demand: `apw pw save` kickstarts it to press Apple's save alert, pinread/saveclick.swift).
 # The daemon job com.lod.apw is never restarted here: `launchctl kickstart -k gui/$(id -u)/com.lod.apw` does that.
 set -euo pipefail
 cd "${0:A:h}/.."
 prefix=${APW_PREFIX:-$HOME/.local/opt/apw/bin}
 label=${APW_PINREAD_LABEL:-com.lod.apw-pinread}
 chrome_label=${APW_CHROMEPAIR_LABEL:-com.lod.apw-chromepair}
+save_label=${APW_SAVECLICK_LABEL:-com.lod.apw-saveclick}
 identity=${APW_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/ {print $2; exit}')}
 
 deno task test
@@ -83,6 +85,8 @@ install_job "$label" false "$prefix/apw-pinread"
 # Always on: keeps the everyday Google Chrome's iCloud Passwords extension paired (pinread/chrome.swift).
 # Same binary as apw-pinread, so it runs under apw-pinread's Accessibility grant.
 install_job "$chrome_label" true "$prefix/apw-pinread" --watch-chrome
+# On demand: `apw pw save` writes ~/.apw/saveclick/request.json and kickstarts it; same binary, same grant.
+install_job "$save_label" false "$prefix/apw-pinread" --save-click
 
 if [[ ${1:-} == --link ]]; then
   brew_apw=$(brew --prefix)/bin/apw
@@ -90,4 +94,4 @@ if [[ ${1:-} == --link ]]; then
   ln -sfn "$prefix/apw" "$brew_apw"
   print "linked $brew_apw -> $prefix/apw"
 fi
-print "installed $prefix/apw and $prefix/apw-pinread; launchd $label and $chrome_label loaded"
+print "installed $prefix/apw and $prefix/apw-pinread; launchd $label, $chrome_label and $save_label loaded"

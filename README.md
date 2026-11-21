@@ -112,9 +112,11 @@ Query for available passwords (JSON output):
 
 `apw pw list google.com`
 
-Create or update a password (the command prompts for the password):
+Create or update a password (password on stdin only; the site is a bare hostname, never `https://…` or a `.lod`
+name). The launchd job `com.lod.apw-saveclick` presses Apple's "Save Password?" / update alert for you, and the command
+exits 0 only when the read-back matches:
 
-`apw pw save google.com username`
+`print -rn -- "$V" | apw pw save google.com username`
 
 Retrieve a one-time code:
 

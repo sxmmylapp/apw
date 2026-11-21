@@ -7,6 +7,9 @@ export const CONFIG_PATH = `${DATA_PATH}/config.json`;
 export const BROWSER_PID_PATH = `${DATA_PATH}/browser.pid`;
 // The PIN reader runs as its own launchd job so macOS checks ITS Accessibility grant, not apw's.
 export const PINREAD_LABEL = Deno.env.get("APW_PINREAD_LABEL") ?? "com.lod.apw-pinread";
+// Presses Apple's "Save Password?" alert for `apw pw save` (apw-pinread --save-click, same grant as the PIN reader).
+export const SAVECLICK_LABEL = Deno.env.get("APW_SAVECLICK_LABEL") ?? "com.lod.apw-saveclick";
+export const SAVECLICK_PATH = `${DATA_PATH}/saveclick`;
 
 export class APWError extends Error {
   constructor(public status: Status, message?: string) {

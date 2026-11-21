@@ -9,6 +9,8 @@
 //   apw-pinread --window-label <title>                 print the Chrome profile label of a window title (tests)
 //   apw-pinread --watch-chrome [--dry-run] [--dump]    keep the everyday Google Chrome paired (chrome.swift);
 //                                                      runs as launchd job com.lod.apw-chromepair
+//   apw-pinread --save-click                           press Apple's save alert for one `apw pw save` (saveclick.swift);
+//                                                      runs as launchd job com.lod.apw-saveclick
 import AppKit
 import ApplicationServices
 import Foundation
@@ -18,7 +20,8 @@ let helperName = "PasswordManagerBrowserExtensionHelper"
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 var dump = false, send = true, timeout = 30.0
 var parseText: String?, labelText: String?
-var watch = false, dryRun = false
+var watch = false, dryRun = false, saveClick = false
+var classifyArgs: [String]?
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let a = args.next() {
   switch a {
@@ -29,6 +32,8 @@ while let a = args.next() {
   case "--window-label": labelText = args.next() ?? ""
   case "--watch-chrome": watch = true
   case "--dry-run": dryRun = true
+  case "--save-click": saveClick = true
+  case "--classify-alert": classifyArgs = Array(CommandLine.arguments.drop { $0 != "--classify-alert" }.dropFirst())
   default: break
   }
 }
@@ -46,6 +51,7 @@ func code(in text: String) -> String? {
 }
 if let t = parseText { if let c = code(in: t) { print(c); exit(0) }; exit(1) }
 if let t = labelText { print(chromeWindowLabel(t)); exit(0) }
+if let a = classifyArgs { classifyAlertCLI(a) }
 
 func parentPid(_ pid: pid_t) -> pid_t? {
   var info = kinfo_proc(); var size = MemoryLayout<kinfo_proc>.stride
@@ -145,6 +151,7 @@ if !trusted {
   log("no Accessibility grant for \(CommandLine.arguments[0]); trying screen OCR (System Settings > Privacy & Security > Accessibility: turn on apw-pinread)")
 }
 if watch { watchChrome(dryRun: dryRun, dump: dump) }
+if saveClick { runSaveClick() }
 let deadline = Date().addingTimeInterval(timeout)
 var found: String?
 repeat {

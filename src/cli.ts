@@ -1,10 +1,11 @@
-import { Command, Input, Secret, Select } from "./deps.ts";
+import { Command, Input, Select } from "./deps.ts";
 import { daemon } from "./daemon.ts";
 import { ApplePasswordManager } from "./client.ts";
 import { BROWSERS, installedBrowsers } from "./browser.ts";
 import { readConfig, writeConfig } from "./config.ts";
 import { APWError, Status, VERSION } from "./const.ts";
 import type { PasswordEntry, Payload } from "./types.ts";
+import { launchdClicker, passwordFromStdin, savePassword } from "./save.ts";
 
 const client = new ApplePasswordManager();
 
@@ -73,22 +74,9 @@ const pw = new Command()
     await client.checkReady();
     const action: string = await Select.prompt({
       message: "Choose an action: ",
-      options: ["list accounts", "get password", "save account"],
+      options: ["list accounts", "get password"],
     });
     const url = await Input.prompt({ message: "Enter URL: ", minLength: 1 });
-    if (action === "save account") {
-      const username = await Input.prompt({
-        message: "Enter username: ",
-        minLength: 1,
-      });
-      const password = await Secret.prompt({
-        message: "Enter password: ",
-        minLength: 1,
-      });
-      await client.saveAccountForURL(url, username, password);
-      printSuccess();
-      return;
-    }
     if (action === "list accounts") {
       printResult(await client.getLoginNamesForURL(url), !json);
     } else if (action === "get password") {
@@ -119,15 +107,46 @@ const pw = new Command()
   .action(async ({ table, json }: { table?: boolean; json?: boolean }, url: string) => {
     printResult(await client.getLoginNamesForURL(url), !!table && !json);
   })
-  .command("save", "Create or update a password.")
-  .option("--stdin", "Read password from stdin instead of prompting.")
-  .arguments("<url:string> <username:string>")
-  .action(async (options: { stdin?: boolean }, url: string, username: string) => {
-    const pwd = options.stdin
-      ? (await new Response(Deno.stdin.readable).text()).trim()
-      : await Secret.prompt({ message: "Enter password: ", minLength: 1 });
-    await client.saveAccountForURL(url, username, pwd);
-    printSuccess();
+  .command(
+    "save",
+    'Create or update a login; password on stdin only: print -rn -- "$V" | apw pw save <host> <user>. ' +
+      "<host> is a bare hostname (example.com). Exit 0 only when the read-back matches.",
+  )
+  .option("--stdin", "Accepted for compatibility; the password is always read from stdin.")
+  .arguments("<host:string> <username:string>")
+  .action(async (_options: { stdin?: boolean }, host: string, username: string) => {
+    if (Deno.stdin.isTerminal()) {
+      throw new APWError(
+        Status.INVALID_PARAM,
+        'the password is read from stdin only: print -rn -- "$V" | apw pw save <host> <user>',
+      );
+    }
+    const password = passwordFromStdin(await new Response(Deno.stdin.readable).text());
+    const report = await savePassword(host, username, password, {
+      read: async (h, u) => {
+        try {
+          const p = await client.getPasswordForURL(h, u);
+          return (p.Entries.find((e) => "USR" in e && e.USR === u) as PasswordEntry | undefined)?.PWD;
+        } catch (e) {
+          if (e instanceof APWError && e.status === Status.NO_RESULTS) return undefined;
+          throw e;
+        }
+      },
+      send: (h, u, p) => client.saveAccountForURL(h, u, p),
+      arm: (h, u) => launchdClicker(h, u),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    const { click, ...rest } = report;
+    console.log(JSON.stringify({
+      status: Status.SUCCESS,
+      ...rest,
+      ...(click && {
+        alert: click.alert,
+        alerts_seen: click.alerts_seen,
+        visible_ms: click.visible_ms,
+        focus_lost_ms: click.focus_lost_ms,
+      }),
+    }));
   });
 
 const start = new Command()
