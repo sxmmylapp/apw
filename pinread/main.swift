@@ -6,6 +6,9 @@
 // Runs as launchd job com.lod.apw-pinread (started by the daemon) so macOS checks THIS binary's grant.
 //   apw-pinread [--dump] [--no-send] [--timeout <s>]   exit 0 sent (or printed with --no-send); 1 no code; 2 send failed
 //   apw-pinread --parse <text>                         print the code found in <text> (tests)
+//   apw-pinread --window-label <title>                 print the Chrome profile label of a window title (tests)
+//   apw-pinread --watch-chrome [--dry-run] [--dump]    keep the everyday Google Chrome paired (chrome.swift);
+//                                                      runs as launchd job com.lod.apw-chromepair
 import AppKit
 import ApplicationServices
 import Foundation
@@ -14,7 +17,8 @@ import Vision
 let helperName = "PasswordManagerBrowserExtensionHelper"
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 var dump = false, send = true, timeout = 30.0
-var parseText: String?
+var parseText: String?, labelText: String?
+var watch = false, dryRun = false
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let a = args.next() {
   switch a {
@@ -22,6 +26,9 @@ while let a = args.next() {
   case "--no-send": send = false
   case "--timeout": if let v = args.next(), let t = Double(v) { timeout = t }
   case "--parse": parseText = args.next() ?? ""
+  case "--window-label": labelText = args.next() ?? ""
+  case "--watch-chrome": watch = true
+  case "--dry-run": dryRun = true
   default: break
   }
 }
@@ -38,6 +45,7 @@ func code(in text: String) -> String? {
   return nil
 }
 if let t = parseText { if let c = code(in: t) { print(c); exit(0) }; exit(1) }
+if let t = labelText { print(chromeWindowLabel(t)); exit(0) }
 
 func parentPid(_ pid: pid_t) -> pid_t? {
   var info = kinfo_proc(); var size = MemoryLayout<kinfo_proc>.stride
@@ -51,12 +59,14 @@ func apwBrowserPid() -> pid_t? {
   return pid_t(s.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
-func helperPids() -> [pid_t] {
-  let browser = apwBrowserPid()
-  return NSWorkspace.shared.runningApplications.filter { $0.executableURL?.lastPathComponent == helperName }
+/// Apple's helpers whose parent process is one of `parents` (a helper is spawned by the browser it serves).
+func helperPids(parents: Set<pid_t>) -> [pid_t] {
+  NSWorkspace.shared.runningApplications.filter { $0.executableURL?.lastPathComponent == helperName }
     .map { $0.processIdentifier }
-    .filter { browser == nil ? false : parentPid($0) == browser }
+    .filter { parentPid($0).map(parents.contains) ?? false }
 }
+
+func helperPids() -> [pid_t] { apwBrowserPid().map { helperPids(parents: [$0]) } ?? [] }
 
 func axStrings(_ el: AXUIElement, _ depth: Int, _ out: inout [String]) {
   if depth > 25 { return }
@@ -134,6 +144,7 @@ if !trusted {
   _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
   log("no Accessibility grant for \(CommandLine.arguments[0]); trying screen OCR (System Settings > Privacy & Security > Accessibility: turn on apw-pinread)")
 }
+if watch { watchChrome(dryRun: dryRun, dump: dump) }
 let deadline = Date().addingTimeInterval(timeout)
 var found: String?
 repeat {

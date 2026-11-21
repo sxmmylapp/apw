@@ -12,7 +12,7 @@
     "compile": "deno compile --allow-all -o apw src/cli.ts",
     "compile:x86_64": "deno compile --allow-all --target x86_64-apple-darwin -o dist/apw-x86_64-apple-darwin src/cli.ts",
     "compile:aarch64": "deno compile --allow-all --target aarch64-apple-darwin -o dist/apw-aarch64-apple-darwin src/cli.ts",
-    "pinread": "swiftc -O -o pinread/apw-pinread pinread/main.swift",
+    "pinread": "swiftc -O -o pinread/apw-pinread pinread/main.swift pinread/chrome.swift",
     "test": "deno task pinread && deno test --allow-all tests/"
   }
 }
