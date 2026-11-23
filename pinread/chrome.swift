@@ -191,11 +191,14 @@ func idleSeconds() -> Double {
 /// started without --user-data-dir (a test or tool instance with its own profile dir is never the daily one).
 /// NSRunningApplication's per-bundle list can come back empty for one pass while Chrome runs (seen 2026-11-21 as
 /// "Google Chrome quit" then "running" with the same pid, which reset every profile's state), so a live pid wins.
-func dailyChrome(current: pid_t) -> NSRunningApplication? {
-  if current != 0, kill(current, 0) == 0, let a = NSRunningApplication(processIdentifier: current),
-    a.bundleIdentifier == dailyChromeBundle, !a.isTerminated
-  {
-    return a
+func dailyChrome(current: pid_t, cached: NSRunningApplication? = nil) -> NSRunningApplication? {
+  if current != 0, kill(current, 0) == 0 {
+    if let a = NSRunningApplication(processIdentifier: current), a.bundleIdentifier == dailyChromeBundle, !a.isTerminated {
+      return a
+    }
+    // LaunchServices can miss a live pid for a pass (the spurious "quit"/"running" pairs of 2026-11-21..23): the pid
+    // answers kill(0) and its executable is still Chrome's, so it is the same Chrome. Keep the object already held.
+    if let c = cached, c.processIdentifier == current, pidPath(current).contains("/Google Chrome.app/") { return c }
   }
   return NSRunningApplication.runningApplications(withBundleIdentifier: dailyChromeBundle)
     .filter { a in
@@ -204,6 +207,12 @@ func dailyChrome(current: pid_t) -> NSRunningApplication? {
       return dailyChromeDataDir.map { dirs == ["--user-data-dir=\($0)"] } ?? dirs.isEmpty
     }
     .min(by: { ($0.launchDate ?? .distantFuture) < ($1.launchDate ?? .distantFuture) })
+}
+
+/// Executable path of a process ("" when unreadable).
+func pidPath(_ pid: pid_t) -> String {
+  var buf = [CChar](repeating: 0, count: 4096)
+  return proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 ? String(cString: buf) : ""
 }
 
 /// argv of a process (KERN_PROCARGS2), [] when unreadable.
@@ -240,6 +249,7 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
   var lastNote = "", lastFront = ""
   var windowlessSince: Date?  // Chrome without the keep-profiles flag has had no window, with another app in front
   var lastRelaunch = Date.distantPast
+  var chromeApp: NSRunningApplication?  // the watched Chrome, kept across passes in which LaunchServices misses it
   var freshLaunch = false  // the watched Chrome was first seen without the flag; try relaunchIfFresh while young
   func note(_ s: String) { if s != lastNote { log("chrome: \(s)"); lastNote = s } }
 
@@ -344,9 +354,13 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
   /// start it again with the flag at once, before Sammy works in it; its session restore brings the windows back.
   /// Only while it is under 15 s old and no key has been typed since it started; at most once per 10 min.
   func relaunchIfFresh(_ chrome: NSRunningApplication) -> Bool {
-    guard let started = chrome.launchDate else { return false }
+    guard let started = chrome.launchDate else { freshLaunch = false; note("Chrome has no launch date; the idle fallback will relaunch it"); return false }
     let age = Date().timeIntervalSince(started)
-    guard age < 15 else { freshLaunch = false; return false }
+    guard age < 15 else {
+      freshLaunch = false
+      note("fresh-launch relaunch gave up: Chrome is \(Int(age)) s old, launch finished: \(chrome.isFinishedLaunching), standard windows: \(standardWindowsAny().count); the idle fallback will relaunch it")
+      return false
+    }
     guard Date().timeIntervalSince(lastRelaunch) > 600 else {
       freshLaunch = false; note("Chrome started without the flag within 10 min of the last relaunch; not relaunching again"); return false
     }
@@ -355,15 +369,28 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       freshLaunch = false; note("Chrome started without the flag and Sammy is already typing; relaunching later once it has no window"); return false
     }
     // A quit sent mid-launch is dropped, and a link that started Chrome is in its first window only once that is up.
-    guard chrome.isFinishedLaunching, !standardWindowsAny().isEmpty else { return false }
+    guard chrome.isFinishedLaunching, !standardWindowsAny().isEmpty else {
+      note("fresh Chrome (\(Int(age)) s old) not ready to relaunch: launch finished: \(chrome.isFinishedLaunching), standard windows: \(standardWindowsAny().count)"); return false
+    }
     spin(0.5)
     freshLaunch = false
     return relaunch(chrome, hidden: false, why: "was just started (\(Int(age * 1000)) ms ago)")
   }
 
+  /// Convergence: a flagless Chrome that no earlier route relaunched (Sammy never closed every window, or it was
+  /// not ready when started) is quit and started again with the flag and --restore-last-session, hidden, once
+  /// Chrome is not in front, Sammy has been idle 60 s, no download runs, and the last relaunch is 10 min old.
+  func relaunchIfIdle(_ chrome: NSRunningApplication) -> Bool {
+    guard idleSeconds() >= 60 else { return false }
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier != chromePid, !frontmost() else { return false }
+    guard Date().timeIntervalSince(lastRelaunch) > 600 else { note("Chrome lacks the flag; within 10 min of the last relaunch, not relaunching it yet"); return false }
+    guard !downloadInProgress() else { note("Chrome lacks the flag but a download is running; not relaunching it"); return false }
+    return relaunch(chrome, hidden: true, restore: true, why: "lacks the flag and Sammy has been idle \(Int(idleSeconds())) s with Chrome in the background")
+  }
+
   /// Quit Chrome (like Cmd+Q) and start it again with its own switches plus the flag. hidden: keep the new
   /// window out of sight and the front with the app Sammy had; else it comes up like the launch it replaces.
-  func relaunch(_ chrome: NSRunningApplication, hidden: Bool, why: String) -> Bool {
+  func relaunch(_ chrome: NSRunningApplication, hidden: Bool, restore: Bool = false, why: String) -> Bool {
     guard let url = chrome.bundleURL else { return false }
     lastRelaunch = Date()
     let old = chromePid
@@ -373,8 +400,9 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     // a new tab), unless the profile restores its session itself. A new tab shows an empty address bar.
     let dataDir = argv.first(where: { $0.hasPrefix("--user-data-dir=") }).map { String($0.dropFirst("--user-data-dir=".count)) }
       ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Google/Chrome").path
-    let urls = hidden || restoresSession(userDataDir: dataDir) ? [] : standardWindowsAny().compactMap(addressBarText)
+    let urls = hidden || restore || restoresSession(userDataDir: dataDir) ? [] : standardWindowsAny().compactMap(addressBarText)
     args += urls
+    if restore { args.append("--restore-last-session") }
     if dryRun { log("chrome: dry run: would relaunch Chrome (pid \(old)), which \(why), with --disable-features=\(keepProfilesFeature)"); return false }
     log("chrome: Chrome (pid \(old)) \(why) and lacks --disable-features=\(keepProfilesFeature); relaunching it with the flag so closing a window no longer drops the pairing")
     let wasFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == old
@@ -417,11 +445,12 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
     return true
   }
   func pass() {
-    guard let chrome = dailyChrome(current: chromePid) else {
-      if chromePid != 0 { log("chrome: Google Chrome quit") }
-      chromePid = 0
+    guard let chrome = dailyChrome(current: chromePid, cached: chromeApp) else {
+      if chromePid != 0 { log("chrome: Google Chrome quit (pid \(chromePid), kill(0) alive: \(kill(chromePid, 0) == 0))") }
+      chromePid = 0; chromeApp = nil
       return
     }
+    chromeApp = chrome
     if chrome.processIdentifier != chromePid {
       chromePid = chrome.processIdentifier
       app = AXUIElementCreateApplication(chromePid)
@@ -434,6 +463,7 @@ func watchChrome(dryRun: Bool, dump _: Bool) -> Never {
       if freshLaunch, relaunchIfFresh(chrome) { return }
       if freshLaunch { return }  // still launching: no presses into a Chrome about to be relaunched
       if relaunchIfWindowless(chrome) { return }
+      if relaunchIfIdle(chrome) { return }
     }
     let helpers = Set(helperPids(parents: [chromePid]))
     if !helpers.subtracting(known).isEmpty {
